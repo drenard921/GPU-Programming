@@ -1,0 +1,82 @@
+CUDA HelloWorld Execution Log
+=============================
+
+$ nvidia-smi
+Sun Jan 25 18:24:08 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 590.52.01              Driver Version: 591.74         CUDA Version: 13.1     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4060 ...    On  |   00000000:01:00.0 Off |                  N/A |
+| N/A   40C    P4             12W /   30W |       0MiB /   8188MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+$ nvcc --version
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Tue_Dec_16_07:23:41_PM_PST_2025
+Cuda compilation tools, release 13.1, V13.1.115
+Build cuda_13.1.r13.1/compiler.37061995_0
+
+$ cat hello-world.cu
+// This is the REAL "hello world" for CUDA!
+// It takes the string "Hello ", prints it, then passes it to CUDA with an array
+// of offsets. Then the offsets are added in parallel to produce the string "World!"
+// By Ingemar Ragnemalm 2010
+// http://computer-graphics.se/hello-world-for-cuda.html
+ 
+#include <stdio.h>
+ 
+const int N = 16; 
+const int blocksize = 16; 
+ 
+__global__ 
+void hello(char *a, int *b) 
+{
+	a[threadIdx.x] += b[threadIdx.x];
+}
+ 
+int main()
+{
+	char a[N] = "Hello \0\0\0\0\0\0";
+	int b[N] = {15, 10, 6, 0, -11, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+ 
+	char *ad;
+	int *bd;
+	const int csize = N*sizeof(char);
+	const int isize = N*sizeof(int);
+ 
+	printf("%s", a);
+ 
+	cudaMalloc( (void**)&ad, csize ); 
+	cudaMalloc( (void**)&bd, isize ); 
+	cudaMemcpy( ad, a, csize, cudaMemcpyHostToDevice ); 
+	cudaMemcpy( bd, b, isize, cudaMemcpyHostToDevice ); 
+	
+	dim3 dimBlock( blocksize, 1 );
+	dim3 dimGrid( 1, 1 );
+	hello<<<dimGrid, dimBlock>>>(ad, bd);
+	cudaMemcpy( a, ad, csize, cudaMemcpyDeviceToHost ); 
+	cudaFree( ad );
+	cudaFree( bd );
+	
+	printf("%s\n", a);
+	return EXIT_SUCCESS;
+}
+$ nvcc -o hello hello-world.cu
+
+$ ./hello
+Hello World!
+
