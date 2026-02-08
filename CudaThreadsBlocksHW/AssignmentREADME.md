@@ -1,7 +1,11 @@
+### Dylan Renard
+### EN.605.617 Introduction to GPU Programming (JHU)
+### Professor Chance Pascale
+### February 7th 2026
+
 # CUDA Threads and Blocks Assignment  
 ## Matrix Addition with Picture Frame Branching (CUDA Threads & Blocks)
 
----
 
 ## Overview
 
@@ -16,7 +20,7 @@ Two versions of the computation are implemented on both CPU and GPU:
    If element is in the **interior region**, compute \(A+B\); otherwise (border), copy \(A\).  
    This models common image-processing logic and introduces **warp divergence** on the GPU.
 
----
+
 
 ## Problem Setup
 
@@ -26,7 +30,7 @@ Two versions of the computation are implemented on both CPU and GPU:
 - Data type: `float`
 - GPU kernels use a **grid-stride loop** so all N elements are processed even when `blocks × threads < N`.
 
----
+
 
 ## Project Structure (key items)
 
@@ -110,7 +114,7 @@ A full grid search was run over 8×8 configurations:
 - **Threads per block:** `8, 16, 32, 64, 128, 256, 512, 1024`
 
 Each combination produced timings recorded into `sweep_results.csv`.  
-`charts.py` generates all plots into `charts_out/`.
+`charts.py` generates all plots into `charts_out/` excluding the heatmaps which are generated from `sweep_launch_configs.py`.
 
 To reproduce charts:
 
@@ -142,8 +146,6 @@ As blocks and threads increase:
 - memory latency is hidden better
 - runtime approaches a **plateau** (diminishing returns once the GPU is saturated)
 
-**How to say this in one sentence:**  
-> GPU performance improves quickly until the device is saturated; beyond that point, more blocks/threads provide little benefit.
 
 ## 2) “Good” thread block sizes cluster around warp-friendly ranges
 
@@ -164,16 +166,36 @@ For a fixed block count, increasing threads-per-block typically improves perform
 - Runtime vs blocks: `charts_out/runtime_vs_blocks_threads128.png`
 - Runtime vs threads: `charts_out/runtime_vs_threads_blocks256.png`
 
-**GPU:** branched kernel is consistently slower than baseline.  
+**GPU:** the branched kernel is generally slower than the baseline across most configurations,
+with the branching penalty varying by launch configuration and occasionally approaching (or
+slightly dipping below) parity due to warp alignment, occupancy effects, and measurement noise. 
 **CPU:** branched loop is often faster than CPU baseline because it skips work on the border.
 
 This “opposite” behavior is one of the main lessons:
 
 - On CPU, a branch that skips work can reduce runtime (and branch predictors can help).
-- On GPU, branching can cause **warp divergence**: within a warp, some threads take the “interior” path and others take the “border” path, forcing serialization of paths.
+- On GPU, branching can cause **warp divergence**: within a warp, some threads take the
+  “interior” path and others take the “border” path, forcing serialization of paths.
 
-**Write-up wording:**  
-> The CPU benefits from skipping border work, while the GPU pays a divergence penalty because warps execute both branch paths when threads disagree.
+**Overall takeaway**  
+The CPU benefits from skipping border work, while the GPU pays a divergence penalty
+because warps execute both branch paths when threads disagree.
+
+### Why a thin, fixed border still causes measurable GPU divergence
+
+Although the picture-frame border is fixed at **32 pixels** and represents only a small
+fraction of the total matrix (≈6% of elements), it still produces a consistent performance
+penalty on the GPU. This is because warp divergence depends not on how many elements branch
+overall, but on **how branch conditions align within individual warps**.
+
+Near the boundary between the border and interior regions, warps may contain a mix of
+threads that take different control-flow paths. When this occurs, the warp must execute
+both paths serially, masking inactive threads on each path and reducing effective
+parallelism.
+
+Because the mapping of matrix elements to warps depends on the **block size, thread count,
+and grid-stride pattern**, the observed branching penalty varies with execution
+configuration, even though the border thickness is fixed across all experiments.
 
 ## 4) Branching penalty varies with configuration (divergence + occupancy interaction)
 
@@ -222,10 +244,94 @@ Small fluctuations appear due to:
 - CPU turbo/frequency scaling
 - cache state and measurement noise
 
-**One-liner explanation:**  
+**Overall Takeaway:**  
 > CPU timings vary slightly across runs because we measure wall-clock time on a multitasking OS, not because the CPU algorithm changes with CUDA parameters.
 
----
+### Addressing the example code from last year:
+Overall, this submission correctly demonstrates basic CUDA concepts such as device memory allocation, kernel launch syntax, and user-configurable execution parameters. However, it contains a critical benchmarking flaw: the GPU kernel is timed without a synchronization point, so the reported “GPU time” measures only kernel launch overhead rather than actual execution time.
+
+```cpp
+int main(int argc,char* argv[]) {
+
+    outputCardInfo();  
+    // GOOD: Prints GPU/device information, which provides useful context
+    // for interpreting performance results.
+
+    int blocks = 3;
+    int threads = 64;
+    // GOOD: Provides default launch parameters.
+    // BAD: These defaults may severely underutilize the GPU for large N.
+
+    if (argc == 2) {
+        blocks = atoi(argv[1]);
+        printf("Blocks changed to:%i\n", blocks);
+        // GOOD: Allows user control over block count.
+        // BAD: No validation (negative, zero, or excessively large values).
+    } 
+    else if (argc == 3) {
+        blocks = atoi(argv[1]);
+        threads = atoi(argv[2]);
+        printf("Blocks changed to:%i\n", blocks);
+        printf("Threads changed to:%i\n", threads);
+        // GOOD: User-configurable execution configuration.
+        // BAD: No checks against device limits (max threads per block).
+    }
+
+    int a[N], b[N], c[N];
+    // GOOD: Simple host-side arrays for demonstration.
+    // BAD: Large stack allocations can be unsafe for large N.
+
+    int *dev_a, *dev_b, *dev_c;
+    cudaMalloc((void**)&dev_a, N * sizeof(int));
+    cudaMalloc((void**)&dev_b, N * sizeof(int));
+    cudaMalloc((void**)&dev_c, N * sizeof(int));
+    // GOOD: Correct use of CUDA device memory allocation.
+    // BAD: No CUDA error checking (cudaGetLastError / cudaPeekAtLastError).
+
+    // Populate our arrays with numbers.
+    for (int i = 0; i < N; i++) {
+        a[i] = -i;
+        b[i] = i*i;
+    }
+    // GOOD: Deterministic initialization simplifies debugging and validation.
+
+    cudaMemcpy(dev_a, a, N * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_b, b, N * sizeof(int), cudaMemcpyHostToDevice);
+    // GOOD: Proper host-to-device data transfer.
+    // BAD: No error checking on cudaMemcpy.
+
+    auto start = std::chrono::high_resolution_clock::now();
+    add<<<blocks,threads>>>(dev_a, dev_b, dev_c);
+    auto stop = std::chrono::high_resolution_clock::now();
+    // BAD (CRITICAL): Kernel launches are asynchronous.
+    // Timing stops before the kernel actually finishes executing.
+    // This measures launch overhead, not computation time.
+
+    cudaMemcpy(c, dev_c, N*sizeof(int), cudaMemcpyDeviceToHost);
+    // BAD (TIMING ISSUE): This call synchronizes the GPU,
+    // but its cost is NOT included in the GPU timing above.
+
+    cudaFree(dev_a);
+    cudaFree(dev_b);
+    cudaFree(dev_c);
+    // GOOD: Proper cleanup of device memory.
+
+    auto startHost = std::chrono::high_resolution_clock::now();
+    addHost(a, b, c);
+    auto stopHost = std::chrono::high_resolution_clock::now();
+    // GOOD: CPU timing correctly captures full execution time.
+
+    std::cout << "\n Time elapsed GPU = "
+              << std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count()
+              << " ns\n";
+    std::cout << " Time elapsed Host = "
+              << std::chrono::duration_cast<std::chrono::nanoseconds>(stopHost - startHost).count()
+              << " ns\n";
+    // BAD: GPU and CPU timings are not comparable due to incorrect GPU timing.
+
+    return 0;
+}
+```
 
 ## Figures (embedded)
 
@@ -249,14 +355,3 @@ Small fluctuations appear due to:
 - ![CPU vs GPU baseline scatter](charts_out/scatter_cpu_vs_gpu_baseline.png)
 - ![CPU vs GPU branched scatter](charts_out/scatter_cpu_vs_gpu_branched.png)
 
----
-
-## Conclusion (rubric-aligned)
-
-This project satisfies the assignment goals by:
-
-- Implementing the **same algorithm** on CPU and GPU (baseline and branched variants)
-- Using user-controlled **blocks and threads-per-block**
-- Measuring runtime and demonstrating that GPU performance depends strongly on launch configuration
-- Demonstrating that **conditional branching reduces GPU efficiency** (warp divergence) while it can reduce work (and runtime) on the CPU
-- Providing a parameter sweep and visual evidence (heatmaps + trend plots) showing saturation behavior, divergence effects, and overall speedup

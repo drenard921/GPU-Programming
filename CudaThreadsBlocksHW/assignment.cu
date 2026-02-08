@@ -481,7 +481,6 @@ std::string outFile = "timing_results" + rawBlocks + "_" + rawThreads + ".txt";
   // Report results:
   //   - Print final configuration + timing results to stdout
   //   - Write the same information to timing_results.txt for submission
-
   std::cout << "--- Timing Results (nanoseconds) ---\n";
   std::cout << "GPU baseline:   " << gpu_baseline_ns << "\n";
   std::cout << "GPU branched:   " << gpu_branched_ns << "\n";
