@@ -184,7 +184,7 @@ because warps execute both branch paths when threads disagree.
 ### Why a thin, fixed border still causes measurable GPU divergence
 
 Although the picture-frame border is fixed at **32 pixels** and represents only a small
-fraction of the total matrix (≈6% of elements), it still produces a consistent performance
+fraction of the total matrix (~6% of elements), it still produces a consistent performance
 penalty on the GPU. This is because warp divergence depends not on how many elements branch
 overall, but on **how branch conditions align within individual warps**.
 
@@ -336,22 +336,22 @@ int main(int argc,char* argv[]) {
 ## Figures (embedded)
 
 ### Heatmaps
-- ![CPU baseline heatmap](charts_out/heat_cpu_baseline.png)
-- ![CPU branched heatmap](charts_out/heat_cpu_branched.png)
-- ![GPU baseline heatmap](charts_out/heat_gpu_baseline.png)
-- ![GPU branched heatmap](charts_out/heat_gpu_branched.png)
+![CPU baseline heatmap](charts_out/heat_cpu_baseline.png)
+![CPU branched heatmap](charts_out/heat_cpu_branched.png)
+![GPU baseline heatmap](charts_out/heat_gpu_baseline.png)
+![GPU branched heatmap](charts_out/heat_gpu_branched.png)
 
 ### Runtime trends
-- ![Runtime vs blocks](charts_out/runtime_vs_blocks_threads128.png)
-- ![Runtime vs threads](charts_out/runtime_vs_threads_blocks256.png)
+![Runtime vs blocks](charts_out/runtime_vs_blocks_threads128.png)
+![Runtime vs threads](charts_out/runtime_vs_threads_blocks256.png)
 
 ### Divergence / branching penalty
-- ![GPU branch penalty vs blocks](charts_out/gpu_branch_penalty_vs_blocks_threads128.png)
-- ![GPU branch penalty vs threads](charts_out/gpu_branch_penalty_vs_threads_blocks256.png)
+![GPU branch penalty vs blocks](charts_out/gpu_branch_penalty_vs_blocks_threads128.png)
+![GPU branch penalty vs threads](charts_out/gpu_branch_penalty_vs_threads_blocks256.png)
 
 ### Speedup and CPU vs GPU scatter
-- ![Speedup vs blocks](charts_out/speedup_vs_blocks_threads128.png)
-- ![Speedup vs threads](charts_out/speedup_vs_threads_blocks256.png)
-- ![CPU vs GPU baseline scatter](charts_out/scatter_cpu_vs_gpu_baseline.png)
-- ![CPU vs GPU branched scatter](charts_out/scatter_cpu_vs_gpu_branched.png)
+![Speedup vs blocks](charts_out/speedup_vs_blocks_threads128.png)
+![Speedup vs threads](charts_out/speedup_vs_threads_blocks256.png)
+![CPU vs GPU baseline scatter](charts_out/scatter_cpu_vs_gpu_baseline.png)
+![CPU vs GPU branched scatter](charts_out/scatter_cpu_vs_gpu_branched.png)
 
