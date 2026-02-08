@@ -5,8 +5,7 @@
 //
 // CUDA Threads & Blocks Assignment — “Picture Frame” Matrix Addition with fixed Non-Operation Border of 32
 //
-// Summary
-// -------
+// Summary:
 // This program compares CPU vs GPU performance for element-wise matrix addition on a
 // 2048x2048 matrix (N = 4,194,304 elements). It implements two versions of the same
 // computation on both CPU and GPU:
@@ -21,8 +20,7 @@
 // The branch models a common image-processing pattern where boundary pixels are treated
 // differently, and it demonstrates warp divergence on the GPU.
 //
-// Command-line usage
-// ------------------
+// Command-line usage:
 //   ./assignment.exe <blocks> <threads_per_block>
 // Example:
 //   ./assignment.exe 512 256
@@ -86,6 +84,7 @@
 #include <fstream>    // std::ofstream
 #include <iostream>   // std::cout
 #include <string>     // std::string
+#include <cctype>      // std::isdigit
 
 // -------------------------------------------------------------------------------------
 // 1) Constants (code quality: no magic numbers)
@@ -273,11 +272,20 @@ __global__ void matrixAddGPU_Branched(const float* A, const float* B, float* C) 
 
 // -------------------------------------------------------------------------------------
 // 5) Utility: write timing results to a text file
-//
 // Writes the final launch configuration and timing measurements for both CPU and GPU
 // implementations to a human-readable text file. The file captures the same information
 // printed to stdout and can be used for later analysis or submission.
 // -------------------------------------------------------------------------------------
+
+// Replace anything weird with underscore so filenames are safe on Windows/Linux.
+static std::string sanitizeTokenForFilename(std::string s) {
+  for (char& c : s) {
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c=='-' || c=='_')) c = '_';
+  }
+  if (s.empty()) s = "missing";
+  return s;
+}
+
 void writeTimingResults(const std::string& filename,
                         int blocks,
                         int threads,
@@ -285,7 +293,7 @@ void writeTimingResults(const std::string& filename,
                         long long gpu_branched_ns,
                         long long cpu_baseline_ns,
                         long long cpu_branched_ns) {
-  std::ofstream out(filename, std::ios::out);  // overwrite each run (simple & clear)
+  std::ofstream out(filename, std::ios::out | std::ios::app);
 
   if (!out.is_open()) {
     std::cerr << "WARNING: Could not open " << filename << " for writing.\n";
@@ -340,38 +348,45 @@ int main(int argc, char* argv[]) {
     threads = std::atoi(argv[2]);
   }
 
+std::string rawBlocks  = (argc >= 2) ? sanitizeTokenForFilename(argv[1]) : "default";
+std::string rawThreads = (argc >= 3) ? sanitizeTokenForFilename(argv[2]) : "default";
+
+// This matches your folder convention:
+std::string outFile = "timing_results" + rawBlocks + "_" + rawThreads + ".txt";
+
+
   clampLaunchConfigToDevice(blocks, threads);
-// ------------------------------------------------------------------
-// Launch configuration guardrails:
-//   1) Clamp invalid inputs and enforce device limits (threads/block, grid X dim).
-//   2) If blocks*threads is wildly larger than N, clamp blocks to a conservative
-//      multiple of N to avoid overflow and excessive kernel launch overhead.
-// ------------------------------------------------------------------
-long long totalThreadsLaunched = 1LL * blocks * threads;
-long long maxReasonableThreads = 10LL * N;   // allow up to 10x oversubscription
+  // ------------------------------------------------------------------
+  // Launch configuration guardrails:
+  //   1) Clamp invalid inputs and enforce device limits (threads/block, grid X dim).
+  //   2) If blocks*threads is wildly larger than N, clamp blocks to a conservative
+  //      multiple of N to avoid overflow and excessive kernel launch overhead.
+  // ------------------------------------------------------------------
+  long long totalThreadsLaunched = 1LL * blocks * threads;
+  long long maxReasonableThreads = 10LL * N;   // allow up to 10x oversubscription
 
-if (totalThreadsLaunched > maxReasonableThreads) {
-    std::cerr << "[Guardrail] Requested launch (blocks * threads = "
-              << totalThreadsLaunched
-              << ") is much larger than problem size N=" << N << ".\n";
+  if (totalThreadsLaunched > maxReasonableThreads) {
+      std::cerr << "[Guardrail] Requested launch (blocks * threads = "
+                << totalThreadsLaunched
+                << ") is much larger than problem size N=" << N << ".\n";
 
-    long long maxBlocks = (maxReasonableThreads + threads - 1) / threads;
-    if (maxBlocks < 1) maxBlocks = 1;
+      long long maxBlocks = (maxReasonableThreads + threads - 1) / threads;
+      if (maxBlocks < 1) maxBlocks = 1;
 
-    if (maxBlocks < blocks) {
-        std::cerr << "[Guardrail] Clamping blocks from "
-                  << blocks << " to " << maxBlocks
-                  << " to avoid overflow and wasted work.\n";
-        blocks = static_cast<int>(maxBlocks);
-    }
-}
+      if (maxBlocks < blocks) {
+          std::cerr << "[Guardrail] Clamping blocks from "
+                    << blocks << " to " << maxBlocks
+                    << " to avoid overflow and wasted work.\n";
+          blocks = static_cast<int>(maxBlocks);
+      }
+  }
 
-// Final launch configuration (always print this)
-std::cout << "Final launch configuration:\n";
-std::cout << "  Blocks: " << blocks << "\n";
-std::cout << "  Threads per block: " << threads << "\n";
-std::cout << "  Total threads launched: "
-          << (1LL * blocks * threads) << "\n\n";
+  // Final launch configuration (always print this)
+  std::cout << "Final launch configuration:\n";
+  std::cout << "  Blocks: " << blocks << "\n";
+  std::cout << "  Threads per block: " << threads << "\n";
+  std::cout << "  Total threads launched: "
+            << (1LL * blocks * threads) << "\n\n";
 
   // ------------------------------------------------------------------
   // Allocate host memory (CPU-side arrays)
@@ -472,12 +487,12 @@ std::cout << "  Total threads launched: "
   std::cout << "CPU baseline:   " << cpu_baseline_ns << "\n";
   std::cout << "CPU branched:   " << cpu_branched_ns << "\n\n";
 
-  writeTimingResults("timing_results.txt",
+  writeTimingResults(outFile,
                      blocks, threads,
                      gpu_baseline_ns, gpu_branched_ns,
                      cpu_baseline_ns, cpu_branched_ns);
 
-  std::cout << "Wrote timing_results.txt\n";
+  std::cout << "Wrote " << outFile << "\n";
 
   // Cleanup: free all host allocations and GPU device allocations.
   delete[] h_A;
