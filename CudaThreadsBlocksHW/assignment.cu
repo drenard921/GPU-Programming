@@ -1,25 +1,83 @@
 // =====================================================================================
-// module3/assignment.cu
+// Dylan Renard
+// EN.605.617 Introduction to GPU Programming (JHU)
+// Professor Chance Pascale
+// February 7th 2026
 //
 // CUDA Threads & Blocks Assignment — “Picture Frame” Matrix Addition
 //
-// What this program demonstrates (matches the rubric):
-//   1) SAME algorithm on CPU and GPU with minimal branching (baseline).
-//        - Baseline: C[i] = A[i] + B[i] for ALL elements.
-//   2) SAME algorithm on CPU and GPU WITH conditional branching (branched).
-//        - Branched: Only compute interior pixels (picture frame). Border is left unchanged.
-//   3) Command-line arguments control CUDA execution configuration:
-//        ./assignment.exe <blocks> <threads_per_block>
-//      Example required by spec: ./assignment.exe 512 256
-//   4) Prints timings to terminal AND writes them to a text file (timing_results.txt).
+// Summary
+// -------
+// This program compares CPU vs GPU performance for element-wise matrix addition on a
+// 2048x2048 matrix (N = 4,194,304 elements). It implements two versions of the same
+// computation on both CPU and GPU:
 //
-// Notes:
-//   - We treat the matrix as a flattened 1D array in row-major order.
-//   - Each GPU thread processes exactly one element.
-//   - BORDER is fixed (not a CLI arg) to keep the experiment controlled.
-//   - Timing uses std::chrono. For GPU, we synchronize after the kernel to ensure completion.
+//   (1) Baseline (minimal branching)
+//       C[i] = A[i] + B[i]   for all i
 //
-// Build/run expectation from assignment spec: make -> assignment.exe, then run with args.
+//   (2) Branched (“picture frame” border exclusion)
+//       If (i is in the interior region): C[i] = A[i] + B[i]
+//       Else (border pixels):            C[i] = A[i]
+//
+// The branch models a common image-processing pattern where boundary pixels are treated
+// differently, and it demonstrates warp divergence on the GPU.
+//
+// Command-line usage
+// ------------------
+//   ./assignment.exe <blocks> <threads_per_block>
+// Example:
+//   ./assignment.exe 512 256
+//
+// Argument behavior and guarantees:
+//   - If <blocks> or <threads_per_block> is omitted, default values (512, 256) are used.
+//   - If either argument is zero, negative, or non-numeric, it is clamped to 1.
+//   - If <threads_per_block> exceeds the device limit, it is clamped to maxThreadsPerBlock.
+//
+//   Dangerous Size Edge Case Guardrails:
+//   - If the requested launch size is extremely large relative to the problem size (N),
+//     the number of blocks is automatically reduced using a conservative upper bound
+//     (a small constant multiple of N). This allows modest oversubscription while
+//     preventing integer overflow and excessive kernel launch overhead.
+//
+//     Example (conservative clamp):
+//       For WIDTH = HEIGHT = 2048,
+//         N = WIDTH * HEIGHT = 2048 * 2048 = 4,194,304 elements (2^22).
+//
+//       A request such as:
+//         ./assignment.exe 100000000 256
+//       would nominally launch 25.6 billion threads. Instead, the program clamps the
+//       number of blocks to 163,840 (with 256 threads per block), resulting in
+//       41,943,040 total threads (~10 × N), which is safe and sufficient to cover all
+//       elements using a grid-stride loop.
+//   - Note: Even if <blocks> is below the device’s theoretical maxGridSize[0], extremely
+//     large block counts are still clamped relative to N to avoid overflow and wasted work.    
+//
+//   Terminal and File Output:
+//   - Device information (GPU name and device limits) is printed at startup.
+//   - The final launch configuration actually used (after all guardrails are applied)
+//     is printed to stdout:
+//       • Blocks
+//       • Threads per block
+//       • Total threads launched = blocks × threads
+//   - Timing results are printed to stdout (nanoseconds):
+//       • GPU baseline time
+//       • GPU branched time
+//       • CPU baseline time
+//       • CPU branched time
+//   - The same configuration + timing results are written to timing_results.txt.
+//
+//   Timing methodology:
+//   - Timing uses std::chrono::high_resolution_clock.
+//   - GPU timings measure elapsed host time around the kernel launch AND include a
+//     cudaDeviceSynchronize() call to ensure the kernel has completed before stopping
+//     the timer (i.e., kernel launch + execution time is captured).
+//   - A one-time GPU warm-up kernel is executed before timing to avoid including CUDA
+//     context initialization overhead in the measured GPU runtimes.
+//   - CPU timings measure the full execution time of the corresponding CPU loop.
+//
+//   - Note: std::chrono GPU timing can include small host-side overhead; CUDA events
+//     would provide more precise device-only timing, but are not required for this assignment.
+
 // =====================================================================================
 
 #include <cuda_runtime.h>
@@ -39,7 +97,12 @@ static constexpr int N      = WIDTH * HEIGHT;    // total elements
 static constexpr int BORDER = 32;                // picture-frame border thickness
 
 // -------------------------------------------------------------------------------------
-// 2) CUDA error-checking helper (makes debugging MUCH easier)
+// 2) CUDA error-checking helper
+//
+// Wraps CUDA runtime API calls and checks their return status.
+// If an error occurs, prints a descriptive message (file + line number)
+// and terminates the program. This ensures CUDA errors are caught
+// immediately instead of failing silently.
 // -------------------------------------------------------------------------------------
 #define CUDA_CHECK(call)                                                          \
   do {                                                                            \
@@ -52,7 +115,10 @@ static constexpr int BORDER = 32;                // picture-frame border thickne
   } while (0)
 
 
-// Query GPU limits and clamp blocks/threads to what the device supports.
+// Query GPU device properties and clamp the user-requested launch configuration
+// to valid hardware limits. Ensures at least one block and thread, clamps
+// threads-per-block to maxThreadsPerBlock, and clamps the grid size to the
+// device’s maximum supported X dimension.
 void clampLaunchConfigToDevice(int& blocks, int& threads) {
   int device = 0;
   CUDA_CHECK(cudaGetDevice(&device));
@@ -90,10 +156,12 @@ void clampLaunchConfigToDevice(int& blocks, int& threads) {
 
 // -------------------------------------------------------------------------------------
 // 3) CPU implementations
-//    These functions do the SAME work as the GPU kernels, but serially on the CPU.
+//    Reference implementations that perform the same computations as the GPU kernels,
+//    executed serially on the CPU for correctness and performance comparison.
 // -------------------------------------------------------------------------------------
 
-// Baseline CPU: no branching besides the for-loop itself.
+// Baseline CPU implementation: performs element-wise addition for all N elements
+// with no conditional branching inside the loop.
 void matrixAddCPU(const float* A, const float* B, float* C) {
   for (int i = 0; i < N; i++) {
     C[i] = A[i] + B[i];
@@ -136,7 +204,8 @@ __global__ void matrixAddGPU(const float* A, const float* B, float* C) {
         (unsigned long long)blockDim.x * (unsigned long long)gridDim.x;
 
     for (unsigned long long i = tid; i < (unsigned long long)N; i += stride) {
-        C[i] = A[i] + B[i];
+        int idx = (int)i;  // safe because i < N
+        C[idx] = A[idx] + B[idx];
     }
 }
 
