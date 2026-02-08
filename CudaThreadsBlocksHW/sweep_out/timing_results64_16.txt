@@ -1,0 +1,19 @@
+Matrix Addition Timing Results (Picture Frame Branching)
+Matrix size: 2048 x 2048 (N=4194304)
+Border thickness (fixed): 32
+
+CUDA launch configuration (from CLI):
+  Blocks: 64
+  Threads per block: 16
+  Total threads launched: 1024
+
+Timings (nanoseconds):
+  GPU baseline:   1483217
+  GPU branched:   1556981
+  CPU baseline:   5127762
+  CPU branched:   2339922
+
+Notes:
+  - GPU timings include kernel launch + execution time and use cudaDeviceSynchronize().
+  - CPU timings include the full loop execution.
+  - Branching may slow the GPU due to warp divergence near the border region.

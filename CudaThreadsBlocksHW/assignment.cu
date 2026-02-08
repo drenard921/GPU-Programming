@@ -84,7 +84,7 @@
 #include <fstream>    // std::ofstream
 #include <iostream>   // std::cout
 #include <string>     // std::string
-#include <cctype>      // std::isdigit
+#include <cctype>      // std::isalnum
 
 // -------------------------------------------------------------------------------------
 // 1) Constants (code quality: no magic numbers)
@@ -293,7 +293,8 @@ void writeTimingResults(const std::string& filename,
                         long long gpu_branched_ns,
                         long long cpu_baseline_ns,
                         long long cpu_branched_ns) {
-  std::ofstream out(filename, std::ios::out | std::ios::app);
+  std::ofstream out(filename, std::ios::out);  // overwrite (one run per file)
+
 
   if (!out.is_open()) {
     std::cerr << "WARNING: Could not open " << filename << " for writing.\n";
