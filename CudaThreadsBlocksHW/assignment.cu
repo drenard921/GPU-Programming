@@ -1,10 +1,9 @@
-// =====================================================================================
 // Dylan Renard
 // EN.605.617 Introduction to GPU Programming (JHU)
 // Professor Chance Pascale
 // February 7th 2026
 //
-// CUDA Threads & Blocks Assignment — “Picture Frame” Matrix Addition
+// CUDA Threads & Blocks Assignment — “Picture Frame” Matrix Addition with fixed Non-Operation Border of 32
 //
 // Summary
 // -------
@@ -191,42 +190,82 @@ void matrixAddCPU_Branched(const float* A, const float* B, float* C) {
 
 // -------------------------------------------------------------------------------------
 // 4) GPU kernels
-//    Each thread computes one element at index i.
+//
+// These kernels implement the same two algorithms as the CPU versions, but in parallel
+// on the GPU:
+//
+//   (1) Baseline kernel (minimal branching):
+//       - Computes C[idx] = A[idx] + B[idx] for every element.
+//       - Only "branching" is implicit in the loop bounds.
+//
+//   (2) Branched kernel (“picture frame”):
+//       - Computes row/col from the flattened index.
+//       - If the element lies in the interior region, performs the add.
+//       - If the element lies in the border region, copies A[idx] instead.
+//       - This conditional can introduce warp divergence near the border.
+//
+// Implementation details:
+//   - A 1D CUDA grid is used (blocks × threads_per_block).
+//   - Each thread computes a unique starting index (tid) and then walks through the
+//     array using a grid-stride loop (i += stride) so ALL N elements are covered even
+//     when blocks*threads < N.
+//   - 64-bit arithmetic is used for tid/stride to avoid integer overflow when users
+//     provide extremely large launch configurations.
 // -------------------------------------------------------------------------------------
 
-// Baseline GPU kernel: minimal branching (only bounds check).
+
+// Baseline GPU kernel: element-wise matrix addition with minimal branching.
+// Each thread computes a global thread index (tid), then processes multiple
+// elements using a grid-stride loop so that all N elements are covered even
+// when blocks × threads < N. 64-bit indexing is used to avoid overflow for
+// very large launch configurations.
 __global__ void matrixAddGPU(const float* A, const float* B, float* C) {
+    // Global thread index across the entire grid
     unsigned long long tid =
         (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
         (unsigned long long)threadIdx.x;
-
+    
+    // Total number of threads launched (stride for grid-stride loop)
     unsigned long long stride =
         (unsigned long long)blockDim.x * (unsigned long long)gridDim.x;
 
+    // Each thread processes multiple elements separated by 'stride'
     for (unsigned long long i = tid; i < (unsigned long long)N; i += stride) {
         int idx = (int)i;  // safe because i < N
         C[idx] = A[idx] + B[idx];
     }
 }
 
-// Branched GPU kernel: picture-frame border exclusion (branching inside kernel).
+// Branched GPU kernel: picture-frame border exclusion.
+// Each thread uses a grid-stride loop to process one or more elements.
+// For each element, the flattened index is converted to (row, col) to
+// determine whether the element lies in the interior region or the border.
+// Interior elements perform the addition; border elements copy A[idx].
+// The conditional branch can introduce warp divergence near the border.
 __global__ void matrixAddGPU_Branched(const float* A, const float* B, float* C) {
+    // Global thread index
     unsigned long long tid =
         (unsigned long long)blockIdx.x * (unsigned long long)blockDim.x +
         (unsigned long long)threadIdx.x;
-
+    
+    // Total number of threads (stride for grid-stride loop)
     unsigned long long stride =
         (unsigned long long)blockDim.x * (unsigned long long)gridDim.x;
-
+    
+    // Grid-stride loop covers all N elements
     for (unsigned long long i = tid; i < (unsigned long long)N; i += stride) {
         int idx = (int)i;          // safe because i < N
+
+        // Convert 1D index to 2D coordinates
         int row = idx / WIDTH;
         int col = idx % WIDTH;
 
+        // Picture-frame interior test
         bool interior =
             (row >= BORDER) && (row < HEIGHT - BORDER) &&
             (col >= BORDER) && (col < WIDTH  - BORDER);
 
+        // Conditional branch (may cause warp divergence)
         if (interior) C[idx] = A[idx] + B[idx];
         else          C[idx] = A[idx];
     }
@@ -234,6 +273,10 @@ __global__ void matrixAddGPU_Branched(const float* A, const float* B, float* C) 
 
 // -------------------------------------------------------------------------------------
 // 5) Utility: write timing results to a text file
+//
+// Writes the final launch configuration and timing measurements for both CPU and GPU
+// implementations to a human-readable text file. The file captures the same information
+// printed to stdout and can be used for later analysis or submission.
 // -------------------------------------------------------------------------------------
 void writeTimingResults(const std::string& filename,
                         int blocks,
@@ -273,7 +316,14 @@ void writeTimingResults(const std::string& filename,
 }
 
 // -------------------------------------------------------------------------------------
-// 6) Main: parse CLI args, allocate memory, run CPU/GPU, time, print, write file
+// 6) Main
+//    - Parse CLI args (blocks, threads_per_block)
+//    - Apply guardrails (device limits + size-based clamp)
+//    - Allocate/init host + device memory
+//    - Warm up GPU (avoid one-time init cost in timings)
+//    - Time GPU kernels and CPU reference loops
+//    - Print results and write timing_results.txt
+//    - Free all allocated resources
 // -------------------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
   // Defaults (safe; still allows running with no args)
@@ -291,8 +341,11 @@ int main(int argc, char* argv[]) {
   }
 
   clampLaunchConfigToDevice(blocks, threads);
-  // ------------------------------------------------------------------
-// Guardrail: prevent absurdly large launches relative to problem size
+// ------------------------------------------------------------------
+// Launch configuration guardrails:
+//   1) Clamp invalid inputs and enforce device limits (threads/block, grid X dim).
+//   2) If blocks*threads is wildly larger than N, clamp blocks to a conservative
+//      multiple of N to avoid overflow and excessive kernel launch overhead.
 // ------------------------------------------------------------------
 long long totalThreadsLaunched = 1LL * blocks * threads;
 long long maxReasonableThreads = 10LL * N;   // allow up to 10x oversubscription
@@ -347,19 +400,14 @@ std::cout << "  Total threads launched: "
   CUDA_CHECK(cudaMemcpy(d_A, h_A, N * sizeof(float), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_B, h_B, N * sizeof(float), cudaMemcpyHostToDevice));
 
-  // ------------------------------------------------------------------
-  // GPU WARM-UP
-  // The first CUDA call can include one-time initialization overhead.
-  // We run a quick kernel once BEFORE timing so the measurements are fair.
-  // ------------------------------------------------------------------
+  // GPU warm-up: the first CUDA kernel launch may incur one-time context/JIT overhead.
+  // Running one kernel before timing makes the measured GPU runtimes more representative.
   matrixAddGPU<<<blocks, threads>>>(d_A, d_B, d_C);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  // ------------------------------------------------------------------
-  // TIMING: GPU baseline
-  // We synchronize after launch so timing includes kernel execution.
-  // ------------------------------------------------------------------
+  // GPU timing: we time around kernel launch + cudaDeviceSynchronize() so the measured
+  // duration includes kernel execution (asynchronous work is forced to complete).
   long long gpu_baseline_ns = 0;
   {
     auto start = std::chrono::high_resolution_clock::now();
@@ -390,9 +438,7 @@ std::cout << "  Total threads launched: "
   // Optionally copy GPU output back (useful for sanity checks / evidence)
   CUDA_CHECK(cudaMemcpy(h_C_gpu, d_C, N * sizeof(float), cudaMemcpyDeviceToHost));
 
-  // ------------------------------------------------------------------
-  // TIMING: CPU baseline
-  // ------------------------------------------------------------------
+  // CPU timing: measure the full execution time of the corresponding CPU loop.
   long long cpu_baseline_ns = 0;
   {
     auto start = std::chrono::high_resolution_clock::now();
@@ -416,18 +462,16 @@ std::cout << "  Total threads launched: "
         std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count();
   }
 
-  // ------------------------------------------------------------------
-  // Print results to terminal (for screenshots / evidence)
-  // ------------------------------------------------------------------
+  // Report results:
+  //   - Print final configuration + timing results to stdout
+  //   - Write the same information to timing_results.txt for submission
+
   std::cout << "--- Timing Results (nanoseconds) ---\n";
   std::cout << "GPU baseline:   " << gpu_baseline_ns << "\n";
   std::cout << "GPU branched:   " << gpu_branched_ns << "\n";
   std::cout << "CPU baseline:   " << cpu_baseline_ns << "\n";
   std::cout << "CPU branched:   " << cpu_branched_ns << "\n\n";
 
-  // ------------------------------------------------------------------
-  // Write results to a text file (for submission)
-  // ------------------------------------------------------------------
   writeTimingResults("timing_results.txt",
                      blocks, threads,
                      gpu_baseline_ns, gpu_branched_ns,
@@ -435,9 +479,7 @@ std::cout << "  Total threads launched: "
 
   std::cout << "Wrote timing_results.txt\n";
 
-  // ------------------------------------------------------------------
-  // Cleanup
-  // ------------------------------------------------------------------
+  // Cleanup: free all host allocations and GPU device allocations.
   delete[] h_A;
   delete[] h_B;
   delete[] h_C_cpu;
