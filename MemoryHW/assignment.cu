@@ -473,6 +473,7 @@ struct Args {
   std::string mode = "warm";
   float intensity = 1.0f;
   bool blur = false;
+  int blurPasses = 1;
   int bx = 16;
   int by = 16;
   bool keepTemp = false;
@@ -486,7 +487,8 @@ static void usage() {
     "  ./cuda_filter --in input.jpg --out output.jpg --bx 16 --by 16\n"
     "  ./cuda_filter --in input.ppm --out output.ppm --bx 32 --by 8\n"
     "  ./cuda_filter --in <path> --out <path> --mode warm|blue|bw --intensity <0..1> [--bx N] [--by N]\n"
-    "  --blur 0|1   Enable shared-memory 3x3 Gaussian blur after LUT\n";
+    "  --blur 0|1   Enable shared-memory 3x3 Gaussian blur after LUT\n"
+    "  --blur-passes N   Number of blur passes (default 1). Larger = blurrier.\n";
 }
 
 static Args parseArgs(int argc, char **argv) {
@@ -528,6 +530,9 @@ static Args parseArgs(int argc, char **argv) {
     } else if (k == "--blur") {
       needVal("--blur");
       a.blur = (std::stoi(argv[++i]) != 0);
+    } else if (k == "--blur-passes") {
+      needVal("--blur-passes");
+      a.blurPasses = std::stoi(argv[++i]);
     } else {
       std::cerr << "Unknown arg: " << k << "\n";
       usage();
@@ -550,6 +555,9 @@ static Args parseArgs(int argc, char **argv) {
     std::cerr << "Invalid --mode. Use warm|blue|bw\n";
     std::exit(1);
   }
+
+  if (a.blurPasses < 1) a.blurPasses = 1;
+  if (a.blurPasses > 20) a.blurPasses = 20; // safety cap
 
   return a;
 }
@@ -622,15 +630,20 @@ int main(int argc, char **argv) {
     std::cerr << "Failed to read PPM: " << ppmInPath << "\n";
     return 1;
   }
+
   const size_t bytes = (size_t)w * (size_t)h * 3u;
   std::vector<unsigned char> h_out(bytes);
 
   // Device alloc (global memory arrays)
-  unsigned char *d_in = nullptr, *d_out = nullptr, *d_tmp = nullptr;
+  unsigned char *d_in = nullptr, *d_out = nullptr;
+  unsigned char *d_tmp = nullptr, *d_tmp2 = nullptr;
+
   CUDA_CHECK(cudaMalloc((void**)&d_in, bytes));
   CUDA_CHECK(cudaMalloc((void**)&d_out, bytes));
+
   if (args.blur) {
     CUDA_CHECK(cudaMalloc((void**)&d_tmp, bytes));
+    CUDA_CHECK(cudaMalloc((void**)&d_tmp2, bytes));
   }
 
   // Copy host->device
@@ -655,14 +668,33 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaEventRecord(start));
 
   if (args.blur) {
-    // 1) LUT into temp
+    // 1) LUT into d_tmp
     lutKernel<<<grid, block>>>(d_in, d_tmp, w, h, modeInt, args.intensity);
     CUDA_CHECK(cudaGetLastError());
 
-    // 2) Shared-memory 3x3 Gaussian blur temp -> out
+    // 2) Multi-pass shared-memory blur (ping-pong)
     size_t sharedBytes = (size_t)(args.bx + 2) * (size_t)(args.by + 2) * sizeof(uchar3);
-    blur3x3Shared<<<grid, block, sharedBytes>>>(d_tmp, d_out, w, h);
-    CUDA_CHECK(cudaGetLastError());
+
+    unsigned char *src = d_tmp;
+    unsigned char *dst = d_tmp2;
+
+    int passes = args.blurPasses;
+    if (passes < 1) passes = 1;
+
+    for (int p = 0; p < passes; p++) {
+      // Final pass writes to d_out
+      if (p == passes - 1) dst = d_out;
+
+      blur3x3Shared<<<grid, block, sharedBytes>>>(src, dst, w, h);
+      CUDA_CHECK(cudaGetLastError());
+
+      // Swap for next pass (unless we just wrote to d_out)
+      if (p != passes - 1) {
+        unsigned char *tmp = src;
+        src = dst;
+        dst = tmp;
+      }
+    }
   } else {
     // LUT directly to output
     lutKernel<<<grid, block>>>(d_in, d_out, w, h, modeInt, args.intensity);
@@ -700,14 +732,18 @@ int main(int argc, char **argv) {
   std::cout << "Block: " << args.bx << "x" << args.by
             << "  Grid: " << grid.x << "x" << grid.y << "\n";
   std::cout << "Mode: " << args.mode << "  Intensity: " << args.intensity << "\n";
-  std::cout << "Blur: " << (args.blur ? "ON (shared mem 3x3)" : "OFF") << "\n";
+  std::cout << "Blur: " << (args.blur ? "ON" : "OFF");
+  if (args.blur) std::cout << "  Passes: " << args.blurPasses;
+  std::cout << "\n";
   std::cout << "Kernel time (LUT" << (args.blur ? "+Blur" : "") << "): " << ms << " ms\n";
   std::cout << "Output: " << (outExt == "ppm" ? ppmOutPath : args.outPath) << "\n";
 
   // Cleanup
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
-  if (d_tmp) CUDA_CHECK(cudaFree(d_tmp));
+
+  if (d_tmp)  CUDA_CHECK(cudaFree(d_tmp));
+  if (d_tmp2) CUDA_CHECK(cudaFree(d_tmp2));
   CUDA_CHECK(cudaFree(d_in));
   CUDA_CHECK(cudaFree(d_out));
 
