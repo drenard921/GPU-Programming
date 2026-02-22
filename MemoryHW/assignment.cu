@@ -84,27 +84,42 @@ static unsigned char f2u8(float x) {
   return (unsigned char)(x * 255.0f + 0.5f);
 }
 
-// Simple contrast S-curve in [0,1]
-static float sCurve(float x, float strength) {
-  // strength ~ 0.0 (none) to 1.0 (strong)
-  // Use smoothstep-ish curve
-  float y = x * x * (3.0f - 2.0f * x);
-  return (1.0f - strength) * x + strength * y;
+// Very strong contrast curve (gamma + S-curve)
+static float strongCurve(float x) {
+  // lift toe a bit
+  x = clamp01(x + 0.04f * (1.0f - x));
+
+  // gamma for midtone shaping
+  float g = 0.85f;               // <1 brightens mids a bit
+  x = powf(x, g);
+
+  // S-curve (very strong)
+  float y = x * x * (3.0f - 2.0f * x);  // smoothstep
+  // push harder: blend toward y heavily
+  return 0.15f * x + 0.85f * y;
 }
 
 static void buildWarmLUT(unsigned char R[256], unsigned char G[256], unsigned char B[256]) {
-  // Dramatic warm: lift reds, slightly lift greens, suppress blues in highlights.
+  // EXTREME warm:
+  // - heavy red/orange push
+  // - heavy blue pull
+  // - noticeable contrast bump
   for (int i = 0; i < 256; i++) {
     float x = i / 255.0f;
+    float c = strongCurve(x);
 
-    // Add contrast first
-    float c = sCurve(x, 0.55f);
+    // highlight bias (very aggressive)
+    float h = c * c * c; // pushes effect into highlights hard
 
-    // Channel-specific gains (more effect in highlights)
-    float highlight = c;                 // already 0..1
-    float r = c * (1.00f + 0.35f * highlight);  // up to +35%
-    float g = c * (1.00f + 0.10f * highlight);  // up to +10%
-    float b = c * (1.00f - 0.25f * highlight);  // down to -25%
+    // Temperature-style offsets (shift mids/highlights)
+    float r = c + 0.28f * h;          // big warm lift
+    float g = c + 0.10f * h;          // modest lift to avoid neon reds
+    float b = c - 0.32f * h;          // heavy blue suppression
+
+    // Additional channel gain (also aggressive)
+    r *= (1.0f + 0.45f * h);          // up to +45%
+    g *= (1.0f + 0.15f * h);          // up to +15%
+    b *= (1.0f - 0.50f * h);          // down to -50%
 
     R[i] = f2u8(r);
     G[i] = f2u8(g);
@@ -113,16 +128,23 @@ static void buildWarmLUT(unsigned char R[256], unsigned char G[256], unsigned ch
 }
 
 static void buildBlueLUT(unsigned char R[256], unsigned char G[256], unsigned char B[256]) {
-  // Dramatic cool/blue: lift blues, suppress reds in highlights.
+  // EXTREME cool/blue:
+  // - heavy blue push
+  // - heavy red pull
+  // - slight green pull for colder look
   for (int i = 0; i < 256; i++) {
     float x = i / 255.0f;
+    float c = strongCurve(x);
 
-    float c = sCurve(x, 0.55f);
-    float highlight = c;
+    float h = c * c * c;
 
-    float r = c * (1.00f - 0.25f * highlight);  // down to -25%
-    float g = c * (1.00f + 0.05f * highlight);  // tiny lift
-    float b = c * (1.00f + 0.35f * highlight);  // up to +35%
+    float r = c - 0.32f * h;          // heavy red suppression
+    float g = c - 0.12f * h;          // slight green suppression
+    float b = c + 0.28f * h;          // big blue lift
+
+    r *= (1.0f - 0.50f * h);          // down to -50%
+    g *= (1.0f - 0.15f * h);          // down to -15%
+    b *= (1.0f + 0.45f * h);          // up to +45%
 
     R[i] = f2u8(r);
     G[i] = f2u8(g);
