@@ -316,6 +316,106 @@ __device__ __forceinline__ unsigned char lerpU8(unsigned char a, unsigned char b
   return (v < 0) ? 0 : (v > 255 ? 255 : (unsigned char)v);
 }
 
+__device__ __forceinline__ int clampi(int v, int lo, int hi) {
+  return (v < lo) ? lo : (v > hi ? hi : v);
+}
+
+__global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int width, int height) {
+  int tx = (int)threadIdx.x;
+  int ty = (int)threadIdx.y;
+  int x  = (int)blockIdx.x * (int)blockDim.x + tx;
+  int y  = (int)blockIdx.y * (int)blockDim.y + ty;
+
+  int tileW = (int)blockDim.x + 2;
+  int tileH = (int)blockDim.y + 2;
+
+  extern __shared__ uchar3 sTile[]; // size = tileW * tileH
+
+  auto loadPixelClamped = [&](int gx, int gy) -> uchar3 {
+    gx = clampi(gx, 0, width  - 1);
+    gy = clampi(gy, 0, height - 1);
+    int idx = (gy * width + gx) * 3;
+    return make_uchar3(in[idx + 0], in[idx + 1], in[idx + 2]);
+  };
+
+  // Write my center pixel into shared tile at (+1,+1)
+  if (x < width && y < height) {
+    sTile[(ty + 1) * tileW + (tx + 1)] = loadPixelClamped(x, y);
+  }
+
+  // Halo loads (only some threads do this)
+  if (tx == 0) {
+    sTile[(ty + 1) * tileW + 0] = loadPixelClamped(x - 1, y);
+  }
+  if (tx == (int)blockDim.x - 1) {
+    sTile[(ty + 1) * tileW + (tx + 2)] = loadPixelClamped(x + 1, y);
+  }
+  if (ty == 0) {
+    sTile[0 * tileW + (tx + 1)] = loadPixelClamped(x, y - 1);
+  }
+  if (ty == (int)blockDim.y - 1) {
+    sTile[(ty + 2) * tileW + (tx + 1)] = loadPixelClamped(x, y + 1);
+  }
+
+  // Corners
+  if (tx == 0 && ty == 0) {
+    sTile[0 * tileW + 0] = loadPixelClamped(x - 1, y - 1);
+  }
+  if (tx == (int)blockDim.x - 1 && ty == 0) {
+    sTile[0 * tileW + (tx + 2)] = loadPixelClamped(x + 1, y - 1);
+  }
+  if (tx == 0 && ty == (int)blockDim.y - 1) {
+    sTile[(ty + 2) * tileW + 0] = loadPixelClamped(x - 1, y + 1);
+  }
+  if (tx == (int)blockDim.x - 1 && ty == (int)blockDim.y - 1) {
+    sTile[(ty + 2) * tileW + (tx + 2)] = loadPixelClamped(x + 1, y + 1);
+  }
+
+  __syncthreads();
+
+  if (x >= width || y >= height) return;
+
+  // Convolution in shared memory
+  int sx = tx + 1;
+  int sy = ty + 1;
+
+  const int w00 = 1, w01 = 2, w02 = 1;
+  const int w10 = 2, w11 = 4, w12 = 2;
+  const int w20 = 1, w21 = 2, w22 = 1;
+
+  uchar3 p00 = sTile[(sy - 1) * tileW + (sx - 1)];
+  uchar3 p01 = sTile[(sy - 1) * tileW + (sx    )];
+  uchar3 p02 = sTile[(sy - 1) * tileW + (sx + 1)];
+  uchar3 p10 = sTile[(sy    ) * tileW + (sx - 1)];
+  uchar3 p11 = sTile[(sy    ) * tileW + (sx    )];
+  uchar3 p12 = sTile[(sy    ) * tileW + (sx + 1)];
+  uchar3 p20 = sTile[(sy + 1) * tileW + (sx - 1)];
+  uchar3 p21 = sTile[(sy + 1) * tileW + (sx    )];
+  uchar3 p22 = sTile[(sy + 1) * tileW + (sx + 1)];
+
+  int r = w00*p00.x + w01*p01.x + w02*p02.x +
+          w10*p10.x + w11*p11.x + w12*p12.x +
+          w20*p20.x + w21*p21.x + w22*p22.x;
+
+  int g = w00*p00.y + w01*p01.y + w02*p02.y +
+          w10*p10.y + w11*p11.y + w12*p12.y +
+          w20*p20.y + w21*p21.y + w22*p22.y;
+
+  int b = w00*p00.z + w01*p01.z + w02*p02.z +
+          w10*p10.z + w11*p11.z + w12*p12.z +
+          w20*p20.z + w21*p21.z + w22*p22.z;
+
+  // divide by 16 with rounding
+  r = (r + 8) >> 4;
+  g = (g + 8) >> 4;
+  b = (b + 8) >> 4;
+
+  int outIdx = (y * width + x) * 3;
+  out[outIdx + 0] = (unsigned char)clampi(r, 0, 255);
+  out[outIdx + 1] = (unsigned char)clampi(g, 0, 255);
+  out[outIdx + 2] = (unsigned char)clampi(b, 0, 255);
+} 
+
 __global__ void lutKernel(const unsigned char *in, unsigned char *out,
                           int width, int height, int modeInt, float intensity) {
   int x = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
@@ -372,6 +472,7 @@ struct Args {
   std::string outPath;
   std::string mode = "warm";
   float intensity = 1.0f;
+  bool blur = false;
   int bx = 16;
   int by = 16;
   bool keepTemp = false;
@@ -384,7 +485,8 @@ static void usage() {
     "\nExamples:\n"
     "  ./cuda_filter --in input.jpg --out output.jpg --bx 16 --by 16\n"
     "  ./cuda_filter --in input.ppm --out output.ppm --bx 32 --by 8\n"
-    "  ./cuda_filter --in <path> --out <path> --mode warm|blue|bw --intensity <0..1> [--bx N] [--by N]\n";
+    "  ./cuda_filter --in <path> --out <path> --mode warm|blue|bw --intensity <0..1> [--bx N] [--by N]\n"
+    "  --blur 0|1   Enable shared-memory 3x3 Gaussian blur after LUT\n";
 }
 
 static Args parseArgs(int argc, char **argv) {
@@ -423,6 +525,9 @@ static Args parseArgs(int argc, char **argv) {
     } else if (k == "--intensity") {
       needVal("--intensity");
       a.intensity = std::stof(argv[++i]);
+    } else if (k == "--blur") {
+      needVal("--blur");
+      a.blur = (std::stoi(argv[++i]) != 0);
     } else {
       std::cerr << "Unknown arg: " << k << "\n";
       usage();
@@ -521,9 +626,12 @@ int main(int argc, char **argv) {
   std::vector<unsigned char> h_out(bytes);
 
   // Device alloc (global memory arrays)
-  unsigned char *d_in = nullptr, *d_out = nullptr;
+  unsigned char *d_in = nullptr, *d_out = nullptr, *d_tmp = nullptr;
   CUDA_CHECK(cudaMalloc((void**)&d_in, bytes));
   CUDA_CHECK(cudaMalloc((void**)&d_out, bytes));
+  if (args.blur) {
+    CUDA_CHECK(cudaMalloc((void**)&d_tmp, bytes));
+  }
 
   // Copy host->device
   CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), bytes, cudaMemcpyHostToDevice));
@@ -545,8 +653,22 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaEventCreate(&stop));
 
   CUDA_CHECK(cudaEventRecord(start));
-  lutKernel<<<grid, block>>>(d_in, d_out, w, h, modeInt, args.intensity);
-  CUDA_CHECK(cudaGetLastError());
+
+  if (args.blur) {
+    // 1) LUT into temp
+    lutKernel<<<grid, block>>>(d_in, d_tmp, w, h, modeInt, args.intensity);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 2) Shared-memory 3x3 Gaussian blur temp -> out
+    size_t sharedBytes = (size_t)(args.bx + 2) * (size_t)(args.by + 2) * sizeof(uchar3);
+    blur3x3Shared<<<grid, block, sharedBytes>>>(d_tmp, d_out, w, h);
+    CUDA_CHECK(cudaGetLastError());
+  } else {
+    // LUT directly to output
+    lutKernel<<<grid, block>>>(d_in, d_out, w, h, modeInt, args.intensity);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
   CUDA_CHECK(cudaEventRecord(stop));
   CUDA_CHECK(cudaEventSynchronize(stop));
 
@@ -578,12 +700,14 @@ int main(int argc, char **argv) {
   std::cout << "Block: " << args.bx << "x" << args.by
             << "  Grid: " << grid.x << "x" << grid.y << "\n";
   std::cout << "Mode: " << args.mode << "  Intensity: " << args.intensity << "\n";
-  std::cout << "Kernel time (LUT): " << ms << " ms\n";
+  std::cout << "Blur: " << (args.blur ? "ON (shared mem 3x3)" : "OFF") << "\n";
+  std::cout << "Kernel time (LUT" << (args.blur ? "+Blur" : "") << "): " << ms << " ms\n";
   std::cout << "Output: " << (outExt == "ppm" ? ppmOutPath : args.outPath) << "\n";
 
   // Cleanup
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
+  if (d_tmp) CUDA_CHECK(cudaFree(d_tmp));
   CUDA_CHECK(cudaFree(d_in));
   CUDA_CHECK(cudaFree(d_out));
 
