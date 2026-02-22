@@ -73,29 +73,60 @@ static unsigned char clampU8(int v) {
   return (unsigned char)v;
 }
 
+static float clamp01(float x) {
+  if (x < 0.0f) return 0.0f;
+  if (x > 1.0f) return 1.0f;
+  return x;
+}
+
+static unsigned char f2u8(float x) {
+  x = clamp01(x);
+  return (unsigned char)(x * 255.0f + 0.5f);
+}
+
+// Simple contrast S-curve in [0,1]
+static float sCurve(float x, float strength) {
+  // strength ~ 0.0 (none) to 1.0 (strong)
+  // Use smoothstep-ish curve
+  float y = x * x * (3.0f - 2.0f * x);
+  return (1.0f - strength) * x + strength * y;
+}
+
 static void buildWarmLUT(unsigned char R[256], unsigned char G[256], unsigned char B[256]) {
-  // Warm: boost red slightly, reduce blue slightly. Keep green mostly stable.
+  // Dramatic warm: lift reds, slightly lift greens, suppress blues in highlights.
   for (int i = 0; i < 256; i++) {
     float x = i / 255.0f;
-    int r = (int)(255.0f * std::min(1.0f, x * 1.10f));
-    int g = i;
-    int b = (int)(255.0f * std::max(0.0f, x * 0.92f));
-    R[i] = clampU8(r);
-    G[i] = clampU8(g);
-    B[i] = clampU8(b);
+
+    // Add contrast first
+    float c = sCurve(x, 0.55f);
+
+    // Channel-specific gains (more effect in highlights)
+    float highlight = c;                 // already 0..1
+    float r = c * (1.00f + 0.35f * highlight);  // up to +35%
+    float g = c * (1.00f + 0.10f * highlight);  // up to +10%
+    float b = c * (1.00f - 0.25f * highlight);  // down to -25%
+
+    R[i] = f2u8(r);
+    G[i] = f2u8(g);
+    B[i] = f2u8(b);
   }
 }
 
 static void buildBlueLUT(unsigned char R[256], unsigned char G[256], unsigned char B[256]) {
-  // Cool/Blue: boost blue slightly, reduce red slightly.
+  // Dramatic cool/blue: lift blues, suppress reds in highlights.
   for (int i = 0; i < 256; i++) {
     float x = i / 255.0f;
-    int r = (int)(255.0f * std::max(0.0f, x * 0.92f));
-    int g = i;
-    int b = (int)(255.0f * std::min(1.0f, x * 1.10f));
-    R[i] = clampU8(r);
-    G[i] = clampU8(g);
-    B[i] = clampU8(b);
+
+    float c = sCurve(x, 0.55f);
+    float highlight = c;
+
+    float r = c * (1.00f - 0.25f * highlight);  // down to -25%
+    float g = c * (1.00f + 0.05f * highlight);  // tiny lift
+    float b = c * (1.00f + 0.35f * highlight);  // up to +35%
+
+    R[i] = f2u8(r);
+    G[i] = f2u8(g);
+    B[i] = f2u8(b);
   }
 }
 
