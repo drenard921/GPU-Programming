@@ -536,106 +536,102 @@ static Args parseArgs(int argc, char **argv) {
   return a;
 }
 
-int main(int argc, char **argv) {
-  Args args = parseArgs(argc, argv);
-  // Notify if blur forced block-dim clamp
 
-  // Ensure output directory exists
-  const std::string outDir = "OutputImages";
-  ensureDir(outDir);
-
-  // If user gave only a filename for --out, place it into OutputImages/
-  if (!hasDirComponent(args.outPath)) {
-    args.outPath = joinPath(outDir, args.outPath);
-  }
-
+struct ImagePaths {
+  std::string outDir;
   std::string magickCmd;
-  if (!haveMagickCommand(magickCmd)) {
-    std::cerr << "Error: ImageMagick not found. Install it or provide .ppm input/output.\n"
-              << "Try: sudo apt install -y imagemagick\n";
-    return 1;
-  }
 
-  if (!fileExists(args.inPath)) {
-    std::cerr << "Input not found: " << args.inPath << "\n";
-    return 1;
-  }
+  std::string ppmInPath;
+  std::string ppmOutPath;
 
-  // Upload LUTs to constant memory once per run
-  uploadLUTsToConstant();
-
-  const std::string inExt  = getExtLower(args.inPath);
-  const std::string outExt = getExtLower(args.outPath);
-  const std::string base   = getBaseName(args.inPath);
-
-  // Temp PPMs always go to OutputImages/
-  const std::string tmpInPPM  = joinPath(outDir, base + "_cuda_in.ppm");
-  const std::string tmpOutPPM = joinPath(outDir, base + "_cuda_out.ppm");
+  std::string tmpInPPM;
+  std::string tmpOutPPM;
 
   bool usedTmpIn = false;
   bool usedTmpOut = false;
+};
 
-  std::string ppmInPath  = args.inPath;
-  std::string ppmOutPath = args.outPath;
+static bool ensureMagick(std::string &magickCmd) {
+  if (haveMagickCommand(magickCmd)) return true;
+  std::cerr
+      << "Error: ImageMagick not found. Install it or provide .ppm input/output.\n"
+      << "Try: sudo apt install -y imagemagick\n";
+  return false;
+}
+
+static ImagePaths preparePathsAndConvertInput(const Args &argsIn,
+                                             const std::string &outExt,
+                                             ImagePaths p) {
+  const std::string inExt = getExtLower(argsIn.inPath);
+  const std::string base  = getBaseName(argsIn.inPath);
+
+  p.tmpInPPM  = joinPath(p.outDir, base + "_cuda_in.ppm");
+  p.tmpOutPPM = joinPath(p.outDir, base + "_cuda_out.ppm");
+
+  p.ppmInPath  = argsIn.inPath;
+  p.ppmOutPath = argsIn.outPath;
 
   // Convert input to PPM if needed
   if (inExt != "ppm") {
     std::ostringstream cmd;
-    cmd << magickCmd << " \"" << args.inPath
-        << "\" -alpha off -depth 8 \"" << tmpInPPM << "\"";
+    cmd << p.magickCmd << " \"" << argsIn.inPath
+        << "\" -alpha off -depth 8 \"" << p.tmpInPPM << "\"";
     std::cout << "[Convert] " << cmd.str() << "\n";
-    if (runCmd(cmd.str()) != 0 || !fileExists(tmpInPPM)) {
+    if (runCmd(cmd.str()) != 0 || !fileExists(p.tmpInPPM)) {
       std::cerr << "Failed to convert input to PPM.\n";
-      return 1;
+      std::exit(1);
     }
-    ppmInPath = tmpInPPM;
-    usedTmpIn = true;
+    p.ppmInPath = p.tmpInPPM;
+    p.usedTmpIn = true;
   }
 
-  // Always write a PPM first if output isn't ppm
+  // If output isn't PPM, write PPM first then convert at end
   if (outExt != "ppm") {
-    ppmOutPath = tmpOutPPM;
-    usedTmpOut = true;
+    p.ppmOutPath = p.tmpOutPPM;
+    p.usedTmpOut = true;
   }
 
-  // Read PPM
-  int w = 0, h = 0;
-  std::vector<unsigned char> h_in;
-  if (!readPPM_P6(ppmInPath, w, h, h_in)) {
-    std::cerr << "Failed to read PPM: " << ppmInPath << "\n";
-    return 1;
+  return p;
+}
+
+static int resolveModeInt(const std::string &mode) {
+  return (mode == "warm") ? (int)Mode::WARM :
+         (mode == "blue") ? (int)Mode::BLUE :
+                            (int)Mode::BW;
+}
+
+struct DeviceBuffers {
+  unsigned char *d_in = nullptr;
+  unsigned char *d_out = nullptr;
+  unsigned char *d_tmp = nullptr;
+  unsigned char *d_tmp2 = nullptr;
+  size_t bytes = 0;
+
+  void alloc(bool needBlurTemps) {
+    CUDA_CHECK(cudaMalloc((void**)&d_in, bytes));
+    CUDA_CHECK(cudaMalloc((void**)&d_out, bytes));
+    if (needBlurTemps) {
+      CUDA_CHECK(cudaMalloc((void**)&d_tmp, bytes));
+      CUDA_CHECK(cudaMalloc((void**)&d_tmp2, bytes));
+    }
   }
 
-  const size_t bytes = (size_t)w * (size_t)h * 3u;
-  std::vector<unsigned char> h_out(bytes);
-
-  // Device alloc (global memory arrays)
-  unsigned char *d_in = nullptr, *d_out = nullptr;
-  unsigned char *d_tmp = nullptr, *d_tmp2 = nullptr;
-
-  CUDA_CHECK(cudaMalloc((void**)&d_in, bytes));
-  CUDA_CHECK(cudaMalloc((void**)&d_out, bytes));
-
-  if (args.blur) {
-    CUDA_CHECK(cudaMalloc((void**)&d_tmp, bytes));
-    CUDA_CHECK(cudaMalloc((void**)&d_tmp2, bytes));
+  void freeAll() {
+    if (d_tmp)  CUDA_CHECK(cudaFree(d_tmp));
+    if (d_tmp2) CUDA_CHECK(cudaFree(d_tmp2));
+    if (d_in)   CUDA_CHECK(cudaFree(d_in));
+    if (d_out)  CUDA_CHECK(cudaFree(d_out));
+    d_in = d_out = d_tmp = d_tmp2 = nullptr;
   }
 
-  // Copy host->device
-  CUDA_CHECK(cudaMemcpy(d_in, h_in.data(), bytes, cudaMemcpyHostToDevice));
+  ~DeviceBuffers() { freeAll(); }
+};
 
-  // Launch config (variable blocks/threads)
-  dim3 block((unsigned)args.bx, (unsigned)args.by, 1);
-  dim3 grid((unsigned)((w + args.bx - 1) / args.bx),
-            (unsigned)((h + args.by - 1) / args.by),
-            1);
-
-  // Resolve mode
-  int modeInt = (args.mode == "warm") ? (int)Mode::WARM :
-                (args.mode == "blue") ? (int)Mode::BLUE :
-                                        (int)Mode::BW;
-
-  // Timing
+static float runPipeline(const Args &args,
+                         const DeviceBuffers &buf,
+                         int w, int h,
+                         dim3 grid, dim3 block,
+                         int modeInt) {
   cudaEvent_t start, stop;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
@@ -643,36 +639,33 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaEventRecord(start));
 
   if (args.blur) {
-    // 1) LUT into d_tmp
-    lutKernel<<<grid, block>>>(d_in, d_tmp, w, h, modeInt, args.intensity);
+    // LUT -> tmp
+    lutKernel<<<grid, block>>>(buf.d_in, buf.d_tmp, w, h, modeInt, args.intensity);
     CUDA_CHECK(cudaGetLastError());
 
-    // 2) Multi-pass shared-memory blur (ping-pong)
-    size_t sharedBytes = (size_t)(block.x + 2) * (size_t)(block.y + 2) * sizeof(uchar3);
+    // Blur passes (ping-pong)
+    const size_t sharedBytes =
+        (size_t)(block.x + 2) * (size_t)(block.y + 2) * sizeof(uchar3);
 
-    unsigned char *src = d_tmp;
-    unsigned char *dst = d_tmp2;
+    unsigned char *src = buf.d_tmp;
+    unsigned char *dst = buf.d_tmp2;
 
-    int passes = args.blurPasses;
-    if (passes < 1) passes = 1;
+    int passes = args.blurPasses < 1 ? 1 : args.blurPasses;
 
     for (int p = 0; p < passes; p++) {
-      // Final pass writes to d_out
-      if (p == passes - 1) dst = d_out;
+      if (p == passes - 1) dst = buf.d_out;
 
       blur3x3Shared<<<grid, block, sharedBytes>>>(src, dst, w, h);
       CUDA_CHECK(cudaGetLastError());
 
-      // Swap for next pass (unless we just wrote to d_out)
       if (p != passes - 1) {
-        unsigned char *tmp = src;
+        unsigned char *t = src;
         src = dst;
-        dst = tmp;
+        dst = t;
       }
     }
   } else {
-    // LUT directly to output
-    lutKernel<<<grid, block>>>(d_in, d_out, w, h, modeInt, args.intensity);
+    lutKernel<<<grid, block>>>(buf.d_in, buf.d_out, w, h, modeInt, args.intensity);
     CUDA_CHECK(cudaGetLastError());
   }
 
@@ -682,54 +675,116 @@ int main(int argc, char **argv) {
   float ms = 0.0f;
   CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
 
-  // Copy device->host
-  CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, bytes, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+  return ms;
+}
 
-  // Write output PPM
-  if (!writePPM_P6(ppmOutPath, w, h, h_out.data())) {
-    std::cerr << "Failed to write PPM: " << ppmOutPath << "\n";
-    return 1;
+static void convertOutputIfNeeded(const ImagePaths &p,
+                                 const std::string &outExt,
+                                 const std::string &finalOutPath) {
+  if (outExt == "ppm") return;
+
+  std::ostringstream cmd;
+  cmd << p.magickCmd << " \"" << p.ppmOutPath << "\" \"" << finalOutPath << "\"";
+  std::cout << "[Convert] " << cmd.str() << "\n";
+
+  if (runCmd(cmd.str()) != 0 || !fileExists(finalOutPath)) {
+    std::cerr << "Failed to convert output PPM to final output.\n";
+    std::exit(1);
   }
+}
 
-  // Convert output PPM to desired format if needed
-  if (outExt != "ppm") {
-    std::ostringstream cmd;
-    cmd << magickCmd << " \"" << ppmOutPath << "\" \"" << args.outPath << "\"";
-    std::cout << "[Convert] " << cmd.str() << "\n";
-    if (runCmd(cmd.str()) != 0 || !fileExists(args.outPath)) {
-      std::cerr << "Failed to convert output PPM to final output.\n";
-      return 1;
-    }
+static void cleanupTempsIfNeeded(const Args &args, const ImagePaths &p) {
+  if (args.keepTemp) {
+    std::cout << "Keeping temp files:\n"
+              << "  " << p.tmpInPPM << "\n"
+              << "  " << p.tmpOutPPM << "\n";
+    return;
   }
+  if (p.usedTmpIn)  std::remove(p.tmpInPPM.c_str());
+  if (p.usedTmpOut) std::remove(p.tmpOutPPM.c_str());
+}
 
-  // Print required runtime info for screenshots
+static void printRunSummary(const Args &args,
+                            int w, int h,
+                            dim3 grid,
+                            float ms,
+                            const std::string &outExt,
+                            const ImagePaths &p) {
   std::cout << "Image: " << w << "x" << h << "\n";
   std::cout << "Block: " << args.bx << "x" << args.by
             << "  Grid: " << grid.x << "x" << grid.y << "\n";
-  std::cout << "Mode: " << args.mode << "  Intensity: " << args.intensity << "\n";
+  std::cout << "Mode: " << args.mode
+            << "  Intensity: " << args.intensity << "\n";
   std::cout << "Blur: " << (args.blur ? "ON" : "OFF");
   if (args.blur) std::cout << "  Passes: " << args.blurPasses;
   std::cout << "\n";
-  std::cout << "Kernel time (LUT" << (args.blur ? "+Blur" : "") << "): " << ms << " ms\n";
-  std::cout << "Output: " << (outExt == "ppm" ? ppmOutPath : args.outPath) << "\n";
+  std::cout << "Kernel time (LUT" << (args.blur ? "+Blur" : "")
+            << "): " << ms << " ms\n";
+  std::cout << "Output: " << (outExt == "ppm" ? p.ppmOutPath : args.outPath)
+            << "\n";
+}
 
-  // Cleanup
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
 
-  if (d_tmp)  CUDA_CHECK(cudaFree(d_tmp));
-  if (d_tmp2) CUDA_CHECK(cudaFree(d_tmp2));
-  CUDA_CHECK(cudaFree(d_in));
-  CUDA_CHECK(cudaFree(d_out));
+int main(int argc, char **argv) {
+  Args args = parseArgs(argc, argv);
 
-  if (!args.keepTemp) {
-    if (usedTmpIn)  std::remove(tmpInPPM.c_str());
-    if (usedTmpOut) std::remove(tmpOutPPM.c_str());
-  } else {
-    std::cout << "Keeping temp files:\n"
-              << "  " << tmpInPPM << "\n"
-              << "  " << tmpOutPPM << "\n";
+  ImagePaths p;
+  p.outDir = "OutputImages";
+  ensureDir(p.outDir);
+
+  // If --out is filename only, route it into OutputImages/
+  if (!hasDirComponent(args.outPath)) {
+    args.outPath = joinPath(p.outDir, args.outPath);
   }
+
+  if (!ensureMagick(p.magickCmd)) return 1;
+
+  if (!fileExists(args.inPath)) {
+    std::cerr << "Input not found: " << args.inPath << "\n";
+    return 1;
+  }
+
+  uploadLUTsToConstant();
+
+  const std::string outExt = getExtLower(args.outPath);
+  p = preparePathsAndConvertInput(args, outExt, p);
+
+  int w = 0, h = 0;
+  std::vector<unsigned char> h_in;
+  if (!readPPM_P6(p.ppmInPath, w, h, h_in)) {
+    std::cerr << "Failed to read PPM: " << p.ppmInPath << "\n";
+    return 1;
+  }
+
+  const size_t bytes = (size_t)w * (size_t)h * 3u;
+  std::vector<unsigned char> h_out(bytes);
+
+  DeviceBuffers buf;
+  buf.bytes = bytes;
+  buf.alloc(args.blur);
+
+  CUDA_CHECK(cudaMemcpy(buf.d_in, h_in.data(), bytes, cudaMemcpyHostToDevice));
+
+  dim3 block((unsigned)args.bx, (unsigned)args.by, 1);
+  dim3 grid((unsigned)((w + args.bx - 1) / args.bx),
+            (unsigned)((h + args.by - 1) / args.by),
+            1);
+
+  const int modeInt = resolveModeInt(args.mode);
+  const float ms = runPipeline(args, buf, w, h, grid, block, modeInt);
+
+  CUDA_CHECK(cudaMemcpy(h_out.data(), buf.d_out, bytes, cudaMemcpyDeviceToHost));
+
+  if (!writePPM_P6(p.ppmOutPath, w, h, h_out.data())) {
+    std::cerr << "Failed to write PPM: " << p.ppmOutPath << "\n";
+    return 1;
+  }
+
+  convertOutputIfNeeded(p, outExt, args.outPath);
+  printRunSummary(args, w, h, grid, ms, outExt, p);
+  cleanupTempsIfNeeded(args, p);
 
   return 0;
 }
