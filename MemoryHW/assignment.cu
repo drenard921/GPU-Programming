@@ -29,7 +29,6 @@
 
 #include <cctype>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 
 #include <filesystem>
@@ -163,17 +162,17 @@ static void uploadLUTsToConstant() {
   buildBlueLUT(blueR, blueG, blueB);
   buildBWLUT(bwR, bwG, bwB);
 
-  CUDA_CHECK(cudaMemcpyToSymbol(c_lutWarmR, warmR, 256));
-  CUDA_CHECK(cudaMemcpyToSymbol(c_lutWarmG, warmG, 256));
-  CUDA_CHECK(cudaMemcpyToSymbol(c_lutWarmB, warmB, 256));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutWarmR, warmR, sizeof(warmR)));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutWarmG, warmG, sizeof(warmG)));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutWarmB, warmB, sizeof(warmB)));
 
-  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBlueR, blueR, 256));
-  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBlueG, blueG, 256));
-  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBlueB, blueB, 256));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBlueR, blueR, sizeof(blueR)));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBlueG, blueG, sizeof(blueG)));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBlueB, blueB, sizeof(blueB)));
 
-  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBWR, bwR, 256));
-  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBWG, bwG, 256));
-  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBWB, bwB, 256));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBWR, bwR, sizeof(bwR)));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBWG, bwG, sizeof(bwG)));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBWB, bwB, sizeof(bwB)));
 }   
 
 static std::string toLower(std::string s) {
@@ -328,40 +327,26 @@ __global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int w
   int y  = (int)blockIdx.y * (int)blockDim.y + ty;
 
   int tileW = (int)blockDim.x + 2;
-  int tileH = (int)blockDim.y + 2;
+  extern __shared__ uchar3 sTile[];
 
-  extern __shared__ uchar3 sTile[]; // size = tileW * tileH
+  int sx = tx + 1;
+  int sy = ty + 1;
 
-  // Write my center pixel into shared tile at (+1,+1)
-  sTile[(ty + 1) * tileW + (tx + 1)] = loadPixelClampedRGB(in, width, height, x, y);
+  // center
+  sTile[sy * tileW + sx] = loadPixelClampedRGB(in, width, height, x, y);
 
-  // Halo loads (only some threads do this)
-  if (tx == 0) {
-    sTile[(ty + 1) * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y);
-  }
-  if (tx == (int)blockDim.x - 1) {
-    sTile[(ty + 1) * tileW + (tx + 2)] = loadPixelClampedRGB(in, width, height, x + 1, y);
-  }
-  if (ty == 0) {
-    sTile[0 * tileW + (tx + 1)] = loadPixelClampedRGB(in, width, height, x, y - 1);
-  }
-  if (ty == (int)blockDim.y - 1) {
-    sTile[(ty + 2) * tileW + (tx + 1)] = loadPixelClampedRGB(in, width, height, x, y + 1);
-  }
+  // halos
+  if (tx == 0) sTile[sy * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y);
+  if (tx == (int)blockDim.x - 1) sTile[sy * tileW + (sx + 1)] = loadPixelClampedRGB(in, width, height, x + 1, y);
 
-  // Corners
-  if (tx == 0 && ty == 0) {
-    sTile[0 * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y - 1);
-  }
-  if (tx == (int)blockDim.x - 1 && ty == 0) {
-    sTile[0 * tileW + (tx + 2)] = loadPixelClampedRGB(in, width, height, x + 1, y - 1);
-  }
-  if (tx == 0 && ty == (int)blockDim.y - 1) {
-    sTile[(ty + 2) * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y + 1);
-  }
-  if (tx == (int)blockDim.x - 1 && ty == (int)blockDim.y - 1) {
-    sTile[(ty + 2) * tileW + (tx + 2)] = loadPixelClampedRGB(in,  width, height, x + 1, y + 1);
-  }
+  if (ty == 0) sTile[0 * tileW + sx] = loadPixelClampedRGB(in, width, height, x, y - 1);
+  if (ty == (int)blockDim.y - 1) sTile[(sy + 1) * tileW + sx] = loadPixelClampedRGB(in, width, height, x, y + 1);
+
+  // corners
+  if (tx == 0 && ty == 0) sTile[0 * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y - 1);
+  if (tx == (int)blockDim.x - 1 && ty == 0) sTile[0 * tileW + (sx + 1)] = loadPixelClampedRGB(in, width, height, x + 1, y - 1);
+  if (tx == 0 && ty == (int)blockDim.y - 1) sTile[(sy + 1) * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y + 1);
+  if (tx == (int)blockDim.x - 1 && ty == (int)blockDim.y - 1) sTile[(sy + 1) * tileW + (sx + 1)] = loadPixelClampedRGB(in, width, height, x + 1, y + 1);
 
   __syncthreads();
 
@@ -533,6 +518,11 @@ static Args parseArgs(int argc, char **argv) {
   if (a.blurPasses < 1) a.blurPasses = 1;
   if (a.blurPasses > 20) a.blurPasses = 20; // safety cap
 
+  if (a.blur) {
+    if (a.bx > 32) a.bx = 32;
+    if (a.by > 32) a.by = 32;
+  }
+
   return a;
 }
 
@@ -647,7 +637,7 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaGetLastError());
 
     // 2) Multi-pass shared-memory blur (ping-pong)
-    size_t sharedBytes = (size_t)(args.bx + 2) * (size_t)(args.by + 2) * sizeof(uchar3);
+    size_t sharedBytes = (size_t)(block.x + 2) * (size_t)(block.y + 2) * sizeof(uchar3);
 
     unsigned char *src = d_tmp;
     unsigned char *dst = d_tmp2;
