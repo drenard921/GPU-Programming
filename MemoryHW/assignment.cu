@@ -333,9 +333,7 @@ __global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int w
   extern __shared__ uchar3 sTile[]; // size = tileW * tileH
 
   // Write my center pixel into shared tile at (+1,+1)
-  if (x < width && y < height) {
-    sTile[(ty + 1) * tileW + (tx + 1)] = loadPixelClampedRGB(in, width, height, x, y);
-  }
+  sTile[(ty + 1) * tileW + (tx + 1)] = loadPixelClampedRGB(in, width, height, x, y);
 
   // Halo loads (only some threads do this)
   if (tx == 0) {
