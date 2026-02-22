@@ -331,13 +331,14 @@ __global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int w
 
   int sx = tx + 1;
   int sy = ty + 1;
+  int sCenter = sy * tileW + sx;
 
   // center
-  sTile[sy * tileW + sx] = loadPixelClampedRGB(in, width, height, x, y);
+  sTile[sCenter + sx] = loadPixelClampedRGB(in, width, height, x, y);
 
   // halos
-  if (tx == 0) sTile[sy * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y);
-  if (tx == (int)blockDim.x - 1) sTile[sy * tileW + (sx + 1)] = loadPixelClampedRGB(in, width, height, x + 1, y);
+  if (tx == 0) sTile[sCenter + 0] = loadPixelClampedRGB(in, width, height, x - 1, y);
+  if (tx == (int)blockDim.x - 1) sTile[sCenter + (sx + 1)] = loadPixelClampedRGB(in, width, height, x + 1, y);
 
   if (ty == 0) sTile[0 * tileW + sx] = loadPixelClampedRGB(in, width, height, x, y - 1);
   if (ty == (int)blockDim.y - 1) sTile[(sy + 1) * tileW + sx] = loadPixelClampedRGB(in, width, height, x, y + 1);
@@ -351,10 +352,6 @@ __global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int w
   __syncthreads();
 
   if (x >= width || y >= height) return;
-
-  // Convolution in shared memory
-  int sx = tx + 1;
-  int sy = ty + 1;
 
   const int w00 = 1, w01 = 2, w02 = 1;
   const int w10 = 2, w11 = 4, w12 = 2;
@@ -528,6 +525,13 @@ static Args parseArgs(int argc, char **argv) {
 
 int main(int argc, char **argv) {
   Args args = parseArgs(argc, argv);
+  // Notify if blur forced block-dim clamp
+  if (args.blur &&
+      (args.bx != args.bxRequested || args.by != args.byRequested)) {
+    std::cout << "[Note] Blur enabled: clamped block dims from "
+              << args.bxRequested << "x" << args.byRequested
+              << " to " << args.bx << "x" << args.by << "\n";
+  }
 
   // Ensure output directory exists
   const std::string outDir = "OutputImages";
