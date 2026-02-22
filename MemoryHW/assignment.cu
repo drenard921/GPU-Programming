@@ -27,12 +27,10 @@
 
 #include <cuda_runtime.h>
 
-#include <cassert>
 #include <cctype>
-#include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 
 #include <filesystem>
 #include <fstream>
@@ -67,11 +65,6 @@ __constant__ unsigned char c_lutBWR[256];
 __constant__ unsigned char c_lutBWG[256];
 __constant__ unsigned char c_lutBWB[256];
 
-static unsigned char clampU8(int v) {
-  if (v < 0) return 0;
-  if (v > 255) return 255;
-  return (unsigned char)v;
-}
 
 static float clamp01(float x) {
   if (x < 0.0f) return 0.0f;
@@ -320,6 +313,14 @@ __device__ __forceinline__ int clampi(int v, int lo, int hi) {
   return (v < lo) ? lo : (v > hi ? hi : v);
 }
 
+__device__ __forceinline__ uchar3 loadPixelClampedRGB(
+    const unsigned char* in, int width, int height, int gx, int gy) {
+  gx = clampi(gx, 0, width - 1);
+  gy = clampi(gy, 0, height - 1);
+  int idx = (gy * width + gx) * 3;
+  return make_uchar3(in[idx + 0], in[idx + 1], in[idx + 2]);
+}
+
 __global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int width, int height) {
   int tx = (int)threadIdx.x;
   int ty = (int)threadIdx.y;
@@ -331,44 +332,37 @@ __global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int w
 
   extern __shared__ uchar3 sTile[]; // size = tileW * tileH
 
-  auto loadPixelClamped = [&](int gx, int gy) -> uchar3 {
-    gx = clampi(gx, 0, width  - 1);
-    gy = clampi(gy, 0, height - 1);
-    int idx = (gy * width + gx) * 3;
-    return make_uchar3(in[idx + 0], in[idx + 1], in[idx + 2]);
-  };
-
   // Write my center pixel into shared tile at (+1,+1)
   if (x < width && y < height) {
-    sTile[(ty + 1) * tileW + (tx + 1)] = loadPixelClamped(x, y);
+    sTile[(ty + 1) * tileW + (tx + 1)] = loadPixelClampedRGB(in, width, height, x, y);
   }
 
   // Halo loads (only some threads do this)
   if (tx == 0) {
-    sTile[(ty + 1) * tileW + 0] = loadPixelClamped(x - 1, y);
+    sTile[(ty + 1) * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y);
   }
   if (tx == (int)blockDim.x - 1) {
-    sTile[(ty + 1) * tileW + (tx + 2)] = loadPixelClamped(x + 1, y);
+    sTile[(ty + 1) * tileW + (tx + 2)] = loadPixelClampedRGB(in, width, height, x + 1, y);
   }
   if (ty == 0) {
-    sTile[0 * tileW + (tx + 1)] = loadPixelClamped(x, y - 1);
+    sTile[0 * tileW + (tx + 1)] = loadPixelClampedRGB(in, width, height, x, y - 1);
   }
   if (ty == (int)blockDim.y - 1) {
-    sTile[(ty + 2) * tileW + (tx + 1)] = loadPixelClamped(x, y + 1);
+    sTile[(ty + 2) * tileW + (tx + 1)] = loadPixelClampedRGB(in, width, height, x, y + 1);
   }
 
   // Corners
   if (tx == 0 && ty == 0) {
-    sTile[0 * tileW + 0] = loadPixelClamped(x - 1, y - 1);
+    sTile[0 * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y - 1);
   }
   if (tx == (int)blockDim.x - 1 && ty == 0) {
-    sTile[0 * tileW + (tx + 2)] = loadPixelClamped(x + 1, y - 1);
+    sTile[0 * tileW + (tx + 2)] = loadPixelClampedRGB(in, width, height, x + 1, y - 1);
   }
   if (tx == 0 && ty == (int)blockDim.y - 1) {
-    sTile[(ty + 2) * tileW + 0] = loadPixelClamped(x - 1, y + 1);
+    sTile[(ty + 2) * tileW + 0] = loadPixelClampedRGB(in, width, height, x - 1, y + 1);
   }
   if (tx == (int)blockDim.x - 1 && ty == (int)blockDim.y - 1) {
-    sTile[(ty + 2) * tileW + (tx + 2)] = loadPixelClamped(x + 1, y + 1);
+    sTile[(ty + 2) * tileW + (tx + 2)] = loadPixelClampedRGB(in,  width, height, x + 1, y + 1);
   }
 
   __syncthreads();
@@ -447,24 +441,6 @@ __global__ void lutKernel(const unsigned char *in, unsigned char *out,
   out[idx + 0] = lerpU8(r, r2, intensity);
   out[idx + 1] = lerpU8(g, g2, intensity);
   out[idx + 2] = lerpU8(b, b2, intensity);
-}
-
-// Identity kernel: copy input pixels to output.
-// This is the “pipeline proof” kernel.
-__global__ void identityKernel(const unsigned char *in, unsigned char *out, int width, int height) {
-  int x = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-  int y = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
-  if (x >= width || y >= height) return;
-
-  int idx = (y * width + x) * 3;
-  // Registers: idx and channel values are held in registers
-  unsigned char r = in[idx + 0];
-  unsigned char g = in[idx + 1];
-  unsigned char b = in[idx + 2];
-
-  out[idx + 0] = r;
-  out[idx + 1] = g;
-  out[idx + 2] = b;
 }
 
 struct Args {
