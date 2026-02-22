@@ -23,9 +23,7 @@
 //   ./cuda_filter --in canyon.jpg --out canyon_out.jpg --bx 16 --by 16
 //   ./cuda_filter --in input.ppm --out output.ppm --bx 32 --by 8
 //
-// Notes:
-//   - This Part 1 program focuses on I/O, CLI, variable block sizing, and timing.
-//   - Later parts will add constant/shared memory features (LUT + blur).
+
 
 #include <cuda_runtime.h>
 
@@ -52,6 +50,85 @@
       std::exit(1);                                                             \
     }                                                                           \
   } while (0)
+
+
+enum class Mode : int { WARM = 0, BLUE = 1, BW = 2 };
+
+// Constant memory LUTs: 3 modes × 3 channels × 256 entries
+__constant__ unsigned char c_lutWarmR[256];
+__constant__ unsigned char c_lutWarmG[256];
+__constant__ unsigned char c_lutWarmB[256];
+
+__constant__ unsigned char c_lutBlueR[256];
+__constant__ unsigned char c_lutBlueG[256];
+__constant__ unsigned char c_lutBlueB[256];
+
+__constant__ unsigned char c_lutBWR[256];
+__constant__ unsigned char c_lutBWG[256];
+__constant__ unsigned char c_lutBWB[256];
+
+static unsigned char clampU8(int v) {
+  if (v < 0) return 0;
+  if (v > 255) return 255;
+  return (unsigned char)v;
+}
+
+static void buildWarmLUT(unsigned char R[256], unsigned char G[256], unsigned char B[256]) {
+  // Warm: boost red slightly, reduce blue slightly. Keep green mostly stable.
+  for (int i = 0; i < 256; i++) {
+    float x = i / 255.0f;
+    int r = (int)(255.0f * std::min(1.0f, x * 1.10f));
+    int g = i;
+    int b = (int)(255.0f * std::max(0.0f, x * 0.92f));
+    R[i] = clampU8(r);
+    G[i] = clampU8(g);
+    B[i] = clampU8(b);
+  }
+}
+
+static void buildBlueLUT(unsigned char R[256], unsigned char G[256], unsigned char B[256]) {
+  // Cool/Blue: boost blue slightly, reduce red slightly.
+  for (int i = 0; i < 256; i++) {
+    float x = i / 255.0f;
+    int r = (int)(255.0f * std::max(0.0f, x * 0.92f));
+    int g = i;
+    int b = (int)(255.0f * std::min(1.0f, x * 1.10f));
+    R[i] = clampU8(r);
+    G[i] = clampU8(g);
+    B[i] = clampU8(b);
+  }
+}
+
+static void buildBWLUT(unsigned char R[256], unsigned char G[256], unsigned char B[256]) {
+  // BW: map intensity to grayscale (identity curve); kernel will compute luma and index these.
+  for (int i = 0; i < 256; i++) {
+    R[i] = (unsigned char)i;
+    G[i] = (unsigned char)i;
+    B[i] = (unsigned char)i;
+  }
+}
+
+static void uploadLUTsToConstant() {
+  unsigned char warmR[256], warmG[256], warmB[256];
+  unsigned char blueR[256], blueG[256], blueB[256];
+  unsigned char bwR[256], bwG[256], bwB[256];
+
+  buildWarmLUT(warmR, warmG, warmB);
+  buildBlueLUT(blueR, blueG, blueB);
+  buildBWLUT(bwR, bwG, bwB);
+
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutWarmR, warmR, 256));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutWarmG, warmG, 256));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutWarmB, warmB, 256));
+
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBlueR, blueR, 256));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBlueG, blueG, 256));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBlueB, blueB, 256));
+
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBWR, bwR, 256));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBWG, bwG, 256));
+  CUDA_CHECK(cudaMemcpyToSymbol(c_lutBWB, bwB, 256));
+}   
 
 static std::string toLower(std::string s) {
   for (char &c : s) c = (char)std::tolower((unsigned char)c);
@@ -180,6 +257,45 @@ static bool writePPM_P6(const std::string &path, int w, int h, const unsigned ch
   return (bool)out;
 }
 
+__device__ __forceinline__ unsigned char lerpU8(unsigned char a, unsigned char b, float t) {
+  float out = (1.0f - t) * (float)a + t * (float)b;
+  int v = (int)(out + 0.5f);
+  return (v < 0) ? 0 : (v > 255 ? 255 : (unsigned char)v);
+}
+
+__global__ void lutKernel(const unsigned char *in, unsigned char *out,
+                          int width, int height, int modeInt, float intensity) {
+  int x = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+  int y = (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y;
+  if (x >= width || y >= height) return;
+
+  int idx = (y * width + x) * 3;
+  unsigned char r = in[idx + 0];
+  unsigned char g = in[idx + 1];
+  unsigned char b = in[idx + 2];
+
+  unsigned char r2 = r, g2 = g, b2 = b;
+
+  // Select LUT from constant memory
+  if (modeInt == (int)Mode::WARM) {
+    r2 = c_lutWarmR[r]; g2 = c_lutWarmG[g]; b2 = c_lutWarmB[b];
+  } else if (modeInt == (int)Mode::BLUE) {
+    r2 = c_lutBlueR[r]; g2 = c_lutBlueG[g]; b2 = c_lutBlueB[b];
+  } else { // BW
+    // Compute luma and map all channels to the same value via BW LUT
+    // (BT.601 luma coefficients)
+    int yv = (int)(0.299f * r + 0.587f * g + 0.114f * b + 0.5f);
+    yv = (yv < 0) ? 0 : (yv > 255 ? 255 : yv);
+    unsigned char yy = (unsigned char)yv;
+    r2 = c_lutBWR[yy]; g2 = c_lutBWG[yy]; b2 = c_lutBWB[yy];
+  }
+
+  // Blend original with LUT output
+  out[idx + 0] = lerpU8(r, r2, intensity);
+  out[idx + 1] = lerpU8(g, g2, intensity);
+  out[idx + 2] = lerpU8(b, b2, intensity);
+}
+
 // Identity kernel: copy input pixels to output.
 // This is the “pipeline proof” kernel.
 __global__ void identityKernel(const unsigned char *in, unsigned char *out, int width, int height) {
@@ -201,6 +317,8 @@ __global__ void identityKernel(const unsigned char *in, unsigned char *out, int 
 struct Args {
   std::string inPath;
   std::string outPath;
+  std::string mode = "warm";
+  float intensity = 1.0f;
   int bx = 16;
   int by = 16;
   bool keepTemp = false;
@@ -212,7 +330,8 @@ static void usage() {
     "  ./cuda_filter --in <path> --out <path> [--bx N] [--by N] [--keep-temp 0|1]\n"
     "\nExamples:\n"
     "  ./cuda_filter --in input.jpg --out output.jpg --bx 16 --by 16\n"
-    "  ./cuda_filter --in input.ppm --out output.ppm --bx 32 --by 8\n";
+    "  ./cuda_filter --in input.ppm --out output.ppm --bx 32 --by 8\n"
+    "  ./cuda_filter --in <path> --out <path> --mode warm|blue|bw --intensity <0..1> [--bx N] [--by N]\n";
 }
 
 static Args parseArgs(int argc, char **argv) {
@@ -245,6 +364,12 @@ static Args parseArgs(int argc, char **argv) {
     } else if (k == "--help" || k == "-h") {
       usage();
       std::exit(0);
+    } else if (k == "--mode") {
+      needVal("--mode");
+      a.mode = toLower(argv[++i]);
+    } else if (k == "--intensity") {
+      needVal("--intensity");
+      a.intensity = std::stof(argv[++i]);
     } else {
       std::cerr << "Unknown arg: " << k << "\n";
       usage();
@@ -260,6 +385,14 @@ static Args parseArgs(int argc, char **argv) {
     std::cerr << "Invalid block dims: bx/by must be in (0..1024]\n";
     std::exit(1);
   }
+
+  if (a.intensity < 0.0f) a.intensity = 0.0f;
+  if (a.intensity > 1.0f) a.intensity = 1.0f;
+  if (a.mode != "warm" && a.mode != "blue" && a.mode != "bw") {
+    std::cerr << "Invalid --mode. Use warm|blue|bw\n";
+    std::exit(1);
+  }
+
   return a;
 }
 
@@ -287,9 +420,12 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  const std::string inExt = getExtLower(args.inPath);
+  // Upload LUTs to constant memory once per run
+  uploadLUTsToConstant();
+
+  const std::string inExt  = getExtLower(args.inPath);
   const std::string outExt = getExtLower(args.outPath);
-  const std::string base = getBaseName(args.inPath);
+  const std::string base   = getBaseName(args.inPath);
 
   // Temp PPMs always go to OutputImages/
   const std::string tmpInPPM  = joinPath(outDir, base + "_cuda_in.ppm");
@@ -298,22 +434,22 @@ int main(int argc, char **argv) {
   bool usedTmpIn = false;
   bool usedTmpOut = false;
 
-  std::string ppmInPath = args.inPath;
+  std::string ppmInPath  = args.inPath;
   std::string ppmOutPath = args.outPath;
 
-// Convert input to PPM if needed
-if (inExt != "ppm") {
-  std::ostringstream cmd;
-  cmd << magickCmd << " \"" << args.inPath
-      << "\" -alpha off -depth 8 \"" << tmpInPPM << "\"";
-  std::cout << "[Convert] " << cmd.str() << "\n";
-  if (runCmd(cmd.str()) != 0 || !fileExists(tmpInPPM)) {
-    std::cerr << "Failed to convert input to PPM.\n";
-    return 1;
+  // Convert input to PPM if needed
+  if (inExt != "ppm") {
+    std::ostringstream cmd;
+    cmd << magickCmd << " \"" << args.inPath
+        << "\" -alpha off -depth 8 \"" << tmpInPPM << "\"";
+    std::cout << "[Convert] " << cmd.str() << "\n";
+    if (runCmd(cmd.str()) != 0 || !fileExists(tmpInPPM)) {
+      std::cerr << "Failed to convert input to PPM.\n";
+      return 1;
+    }
+    ppmInPath = tmpInPPM;
+    usedTmpIn = true;
   }
-  ppmInPath = tmpInPPM;
-  usedTmpIn = true;
-}
 
   // Always write a PPM first if output isn't ppm
   if (outExt != "ppm") {
@@ -345,13 +481,18 @@ if (inExt != "ppm") {
             (unsigned)((h + args.by - 1) / args.by),
             1);
 
+  // Resolve mode
+  int modeInt = (args.mode == "warm") ? (int)Mode::WARM :
+                (args.mode == "blue") ? (int)Mode::BLUE :
+                                        (int)Mode::BW;
+
   // Timing
   cudaEvent_t start, stop;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
 
   CUDA_CHECK(cudaEventRecord(start));
-  identityKernel<<<grid, block>>>(d_in, d_out, w, h);
+  lutKernel<<<grid, block>>>(d_in, d_out, w, h, modeInt, args.intensity);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaEventRecord(stop));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -383,7 +524,8 @@ if (inExt != "ppm") {
   std::cout << "Image: " << w << "x" << h << "\n";
   std::cout << "Block: " << args.bx << "x" << args.by
             << "  Grid: " << grid.x << "x" << grid.y << "\n";
-  std::cout << "Kernel time (identity): " << ms << " ms\n";
+  std::cout << "Mode: " << args.mode << "  Intensity: " << args.intensity << "\n";
+  std::cout << "Kernel time (LUT): " << ms << " ms\n";
   std::cout << "Output: " << (outExt == "ppm" ? ppmOutPath : args.outPath) << "\n";
 
   // Cleanup
