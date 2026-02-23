@@ -1,0 +1,20 @@
+[Convert] convert "/mnt/c/Users/drena/OneDrive/Desktop/CodingRepos/GPU-Programming/MemoryHW/InputImages/Smallville.png" -alpha off -depth 8 "OutputImages/Smallville_cuda_in.ppm"
+[Convert] convert "OutputImages/Smallville_cuda_out.ppm" "OutputImages/Smallville_E_bw_16x16_blur_p1.png"
+
+CUDA Run Summary
+Image
+  Size: 256 x 256  Pixels: 65536
+Launch: block 16x16 tpb 256 grid 16x16 blocks 256
+Config
+  Mode: bw  Intensity: 1
+  Blur: ON  Passes: 1
+Timing (ms): HtoD 0.116864  Kernel 0.17248  DtoH 0.064736  Total 0.35408
+Memory
+  Allocated (estimated): 786432 bytes  (0.75 MiB)
+  GPU Total: 7.99561 GiB
+  GPU Free Before Alloc: 6.92773 GiB
+  GPU Free After  Alloc: 6.92578 GiB
+Output
+  OutputImages/Smallville_E_bw_16x16_blur_p1.png
+RESULT w=256 h=256 bx=16 by=16 tpb=256 gridx=16 gridy=16 mode=bw blur=1 passes=1 htod_ms=0.116864 kernel_ms=0.17248 dtoh_ms=0.064736 total_ms=0.35408 alloc_bytes=786432 free0=7438598144 free1=7436500992 total_mem=8585216000
+
