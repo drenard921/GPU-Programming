@@ -1,27 +1,53 @@
 // Dylan Renard
 // EN.605.617 Introduction to GPU Programming (JHU)
 // Professor Chance Pascale
-// February 21st 2026
+// February 21, 2026
 //
-// CUDA Memory Assignment — 1D .cube LUT Filter Applier + Optional Shared-Memory Gaussian Blur
+// CUDA Memory Hierarchy Assignment
+// 1D LUT Image Filter with Optional Shared-Memory Gaussian Blur
 //
-// Summary:
-// This program demonstrates CUDA memory hierarchy usage by applying a selectable color
-// “coating” (1D LUT) to an input image, with an optional 3x3 Gaussian blur implemented
-// using shared memory tiling. The tool supports standard image inputs (e.g., JPG/PNG)
-// via ImageMagick conversion to an intermediate PPM (P6) format, then runs CUDA kernels
-// on raw RGB bytes, and converts the result back to the requested output format
-
-// Output location:
-//   - All intermediate PPMs are written to ./OutputImages/
-//   - If --out is provided as a filename (no directory), the final output is also saved to ./OutputImages/
+// Overview:
+// This program demonstrates practical usage of the CUDA memory hierarchy by
+// applying a selectable 1D color Look-Up Table (LUT) to an input image,
+// followed optionally by a 3x3 Gaussian blur implemented using shared memory tiling.
 //
-// Command-line usage:
-//   ./cuda_filter --in <path> --out <path> [--bx N] [--by N] [--keep-temp 0|1]
+// Memory Hierarchy Demonstrated:
+//   • Host Memory      - Image loading, LUT construction, and final image storage
+//   • Global Memory    - Device image buffers (input, output, and ping-pong blur buffers)
+//   • Constant Memory  - Precomputed 1D LUT tables stored in __constant__ memory
+//                        and broadcast across threads during color mapping
+//   • Shared Memory    - Tile plus halo staging for 3x3 stencil blur kernel
+//   • Registers        - Per-thread local variables used inside kernels
 //
-// Examples:
-//   ./cuda_filter --in canyon.jpg --out canyon_out.jpg --bx 16 --by 16
-//   ./cuda_filter --in input.ppm --out output.ppm --bx 32 --by 8
+// Program Flow:
+//   1. Input image is converted to PPM (P6) using ImageMagick if necessary.
+//   2. LUT tables are built on the host and copied into constant memory.
+//   3. Image is copied Host → Device (global memory).
+//   4. LUT kernel executes (constant + global memory).
+//   5. Optional multi-pass shared-memory blur executes.
+//   6. Image is copied Device → Host.
+//   7. Result is written and converted back to requested format.
+//
+// Performance Instrumentation:
+//   • Separate timing for Host→Device, Kernel, and Device→Host.
+//   • Variable block dimensions via --bx and --by.
+//   • Structured RESULT line printed for automated grid search parsing.
+//
+// Output Location:
+//   - Intermediate PPM files written to ./OutputImages/
+//   - If --out is filename only, final output is also saved to ./OutputImages/
+//
+// Command-Line Usage:
+//   ./cuda_filter --in <path> --out <path>
+//                 [--mode warm|blue|bw]
+//                 [--intensity 0..1]
+//                 [--blur 0|1] [--blur-passes N]
+//                 [--bx N] [--by N]
+//                 [--keep-temp 0|1]
+//
+// Example:
+//   ./cuda_filter --in canyon.jpg --out canyon_bw.jpg --mode bw --bx 32 --by 8
+//   ./cuda_filter --in input.ppm --out output.ppm --blur 1 --blur-passes 3
 //
 
 
@@ -320,6 +346,25 @@ __device__ __forceinline__ uchar3 loadPixelClampedRGB(
   return make_uchar3(in[idx + 0], in[idx + 1], in[idx + 2]);
 }
 
+// blur3x3Shared
+//
+// Applies a 3x3 Gaussian blur using shared memory tiling.
+//
+// Memory Usage:
+//   - Global memory: input and output image buffers
+//   - Shared memory: per-block tile including 1-pixel halo on all sides
+//   - Registers: per-thread accumulators and temporary pixel values
+//
+// Each thread maps to one output pixel. Threads within a block cooperatively
+// load a tile of pixels from global memory into shared memory. The tile is
+// padded with a 1-pixel halo so that every thread can compute its 3x3 stencil
+// entirely from shared memory after synchronization.
+//
+// This reduces redundant global memory reads, since neighboring threads reuse
+// overlapping pixels from the shared tile instead of reloading them from
+// global memory multiple times.
+//
+// Edge handling is performed via clamped loads in loadPixelClampedRGB().
 __global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int width, int height) {
   int tx = (int)threadIdx.x;
   int ty = (int)threadIdx.y;
@@ -331,7 +376,7 @@ __global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int w
 
   int sx = tx + 1;
   int sy = ty + 1;
- int sCenter = sy * tileW + sx;
+  int sCenter = sy * tileW + sx;
 
   // center
   sTile[sCenter] = loadPixelClampedRGB(in, width, height, x, y);
@@ -403,6 +448,22 @@ __global__ void blur3x3Shared(const unsigned char* in, unsigned char* out, int w
   out[outIdx + 2] = (unsigned char)clampi(b, 0, 255);
 } 
 
+// lutKernel
+//
+// Applies a selectable 1D color Look-Up Table (LUT) to each pixel.
+//
+// Memory Usage:
+//   - Global memory: input and output image buffers
+//   - Constant memory: precomputed LUT tables (broadcast across threads)
+//   - Registers: per-thread RGB values and temporaries
+//
+// Each thread processes one pixel. The original RGB values are used as
+// indices into LUT tables stored in constant memory. Because many threads
+// access LUT values simultaneously, constant memory provides efficient
+// broadcast caching behavior.
+//
+// The final pixel is optionally blended with the original value based on
+// the provided intensity parameter.
 __global__ void lutKernel(const unsigned char *in, unsigned char *out,
                           int width, int height, int modeInt, float intensity) {
   int x = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
