@@ -713,39 +713,55 @@ static void printRunSummary(const Args &args,
                             float kernel_ms,
                             float dtoh_ms,
                             size_t alloc_bytes,
-                            size_t free0,
-                            size_t free1,
+                            size_t free_before,
+                            size_t free_after_alloc,
                             size_t total_mem,
                             const std::string &outExt,
                             const ImagePaths &p) {
   const int tpb = args.bx * args.by;
   const float total_ms = htod_ms + kernel_ms + dtoh_ms;
 
-  std::cout << "Image: " << w << "x" << h << "\n";
-  std::cout << "Block: " << args.bx << "x" << args.by
-            << "  Grid: " << grid.x << "x" << grid.y << "\n";
-  std::cout << "Threads per block: " << tpb << "\n";
-  std::cout << "Mode: " << args.mode
+  auto toMiB = [](size_t bytes) -> double {
+    return (double)bytes / (1024.0 * 1024.0);
+  };
+  auto toGiB = [](size_t bytes) -> double {
+    return (double)bytes / (1024.0 * 1024.0 * 1024.0);
+  };
+
+  std::cout << "\n";
+  std::cout << "CUDA Run Summary\n";
+  std::cout << "Image\n";
+  std::cout << "  Size: " << w << " x " << h
+            << "  Pixels: " << (size_t)w * (size_t)h << "\n";
+
+  std::cout << "Launch: block " << args.bx << "x" << args.by
+          << " tpb " << tpb
+          << " grid " << grid.x << "x" << grid.y
+          << " blocks " << (size_t)grid.x * (size_t)grid.y << "\n";
+
+  std::cout << "Config\n";
+  std::cout << "  Mode: " << args.mode
             << "  Intensity: " << args.intensity << "\n";
-  std::cout << "Blur: " << (args.blur ? "ON" : "OFF");
+  std::cout << "  Blur: " << (args.blur ? "ON" : "OFF");
   if (args.blur) std::cout << "  Passes: " << args.blurPasses;
   std::cout << "\n";
 
-  std::cout << "Timing ms: "
-            << "HtoD=" << htod_ms << " "
-            << "Kernel=" << kernel_ms << " "
-            << "DtoH=" << dtoh_ms << " "
-            << "Total=" << total_ms << "\n";
+  std::cout << "Timing (ms): HtoD " << htod_ms
+          << "  Kernel " << kernel_ms
+          << "  DtoH " << dtoh_ms
+          << "  Total " << total_ms << "\n";
 
-  std::cout << "Estimated device alloc bytes: " << alloc_bytes << "\n";
-  std::cout << "GPU mem free before: " << free0
-            << " free after: " << free1
-            << " total: " << total_mem << "\n";
+  std::cout << "Memory\n";
+  std::cout << "  Allocated (estimated): " << alloc_bytes
+            << " bytes  (" << toMiB(alloc_bytes) << " MiB)\n";
+  std::cout << "  GPU Total: " << toGiB(total_mem) << " GiB\n";
+  std::cout << "  GPU Free Before Alloc: " << toGiB(free_before) << " GiB\n";
+  std::cout << "  GPU Free After  Alloc: " << toGiB(free_after_alloc) << " GiB\n";
 
-  std::cout << "Output: " << (outExt == "ppm" ? p.ppmOutPath : args.outPath)
-            << "\n";
+  std::cout << "Output\n";
+  std::cout << "  " << (outExt == "ppm" ? p.ppmOutPath : args.outPath) << "\n";
 
-  // One parseable line for your Python grid search
+  // Parse friendly single line for Python
   std::cout
       << "RESULT "
       << "w=" << w << " "
@@ -763,10 +779,12 @@ static void printRunSummary(const Args &args,
       << "dtoh_ms=" << dtoh_ms << " "
       << "total_ms=" << total_ms << " "
       << "alloc_bytes=" << alloc_bytes << " "
-      << "free0=" << free0 << " "
-      << "free1=" << free1 << " "
+      << "free0=" << free_before << " "
+      << "free1=" << free_after_alloc << " "
       << "total_mem=" << total_mem
-      << "\n";
+      << "\n\n";
+
+  std::cout << std::flush;
 }
 
 
@@ -777,7 +795,6 @@ int main(int argc, char **argv) {
   p.outDir = "OutputImages";
   ensureDir(p.outDir);
 
-  // If --out is filename only, route it into OutputImages/
   if (!hasDirComponent(args.outPath)) {
     args.outPath = joinPath(p.outDir, args.outPath);
   }
@@ -804,15 +821,23 @@ int main(int argc, char **argv) {
   const size_t bytes = (size_t)w * (size_t)h * 3u;
   std::vector<unsigned char> h_out(bytes);
 
+  // Memory snapshot before any cudaMalloc
+  size_t free0 = 0, total0 = 0;
+  CUDA_CHECK(cudaMemGetInfo(&free0, &total0));
+
   DeviceBuffers buf;
   buf.bytes = bytes;
   buf.alloc(args.blur);
-  
-  size_t free0 = 0, total0 = 0, free1 = 0, total1 = 0;
-  CUDA_CHECK(cudaMemGetInfo(&free0, &total0));
-   CUDA_CHECK(cudaMemGetInfo(&free1, &total1));
 
-  // Timing buckets
+  // Memory snapshot after allocations (should be lower)
+  size_t free1 = 0, total1 = 0;
+  CUDA_CHECK(cudaMemGetInfo(&free1, &total1));
+
+  // Estimated alloc size (exact for your buffers)
+  const int numBuf = args.blur ? 4 : 2;
+  const size_t alloc_bytes = (size_t)numBuf * bytes;
+
+  // Create timing events for copies
   cudaEvent_t e0, e1, e2, e3;
   CUDA_CHECK(cudaEventCreate(&e0));
   CUDA_CHECK(cudaEventCreate(&e1));
@@ -822,32 +847,31 @@ int main(int argc, char **argv) {
   float htod_ms = 0.0f;
   float dtoh_ms = 0.0f;
 
+  // HtoD
   CUDA_CHECK(cudaEventRecord(e0));
   CUDA_CHECK(cudaMemcpy(buf.d_in, h_in.data(), bytes, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaEventRecord(e1));
   CUDA_CHECK(cudaEventSynchronize(e1));
   CUDA_CHECK(cudaEventElapsedTime(&htod_ms, e0, e1));
 
+  // Launch config
   dim3 block((unsigned)args.bx, (unsigned)args.by, 1);
   dim3 grid((unsigned)((w + args.bx - 1) / args.bx),
             (unsigned)((h + args.by - 1) / args.by),
             1);
 
+  // Kernel pipeline timing
   const int modeInt = resolveModeInt(args.mode);
   const float kernel_ms = runPipeline(args, buf, w, h, grid, block, modeInt);
 
-
+  // DtoH
   CUDA_CHECK(cudaEventRecord(e2));
   CUDA_CHECK(cudaMemcpy(h_out.data(), buf.d_out, bytes, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaEventRecord(e3));
   CUDA_CHECK(cudaEventSynchronize(e3));
   CUDA_CHECK(cudaEventElapsedTime(&dtoh_ms, e2, e3));
-  CUDA_CHECK(cudaMemGetInfo(&free1, &total1));
-  CUDA_CHECK(cudaEventDestroy(e0));
-  CUDA_CHECK(cudaEventDestroy(e1));
-  CUDA_CHECK(cudaEventDestroy(e2));
-  CUDA_CHECK(cudaEventDestroy(e3));
 
+  // Write output PPM
   if (!writePPM_P6(p.ppmOutPath, w, h, h_out.data())) {
     std::cerr << "Failed to write PPM: " << p.ppmOutPath << "\n";
     return 1;
@@ -855,12 +879,17 @@ int main(int argc, char **argv) {
 
   convertOutputIfNeeded(p, outExt, args.outPath);
 
-  const size_t alloc_bytes = bytes * (args.blur ? 4u : 2u);
   printRunSummary(args, w, h, grid,
-                htod_ms, kernel_ms, dtoh_ms,
-                alloc_bytes, free0, free1, total0,
-                outExt, p);
+                  htod_ms, kernel_ms, dtoh_ms,
+                  alloc_bytes, free0, free1, total0,
+                  outExt, p);
+
   cleanupTempsIfNeeded(args, p);
+
+  CUDA_CHECK(cudaEventDestroy(e0));
+  CUDA_CHECK(cudaEventDestroy(e1));
+  CUDA_CHECK(cudaEventDestroy(e2));
+  CUDA_CHECK(cudaEventDestroy(e3));
 
   return 0;
 }
