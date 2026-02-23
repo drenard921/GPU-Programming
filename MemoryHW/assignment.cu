@@ -709,21 +709,64 @@ static void cleanupTempsIfNeeded(const Args &args, const ImagePaths &p) {
 static void printRunSummary(const Args &args,
                             int w, int h,
                             dim3 grid,
-                            float ms,
+                            float htod_ms,
+                            float kernel_ms,
+                            float dtoh_ms,
+                            size_t alloc_bytes,
+                            size_t free0,
+                            size_t free1,
+                            size_t total_mem,
                             const std::string &outExt,
                             const ImagePaths &p) {
+  const int tpb = args.bx * args.by;
+  const float total_ms = htod_ms + kernel_ms + dtoh_ms;
+
   std::cout << "Image: " << w << "x" << h << "\n";
   std::cout << "Block: " << args.bx << "x" << args.by
             << "  Grid: " << grid.x << "x" << grid.y << "\n";
+  std::cout << "Threads per block: " << tpb << "\n";
   std::cout << "Mode: " << args.mode
             << "  Intensity: " << args.intensity << "\n";
   std::cout << "Blur: " << (args.blur ? "ON" : "OFF");
   if (args.blur) std::cout << "  Passes: " << args.blurPasses;
   std::cout << "\n";
-  std::cout << "Kernel time (LUT" << (args.blur ? "+Blur" : "")
-            << "): " << ms << " ms\n";
+
+  std::cout << "Timing ms: "
+            << "HtoD=" << htod_ms << " "
+            << "Kernel=" << kernel_ms << " "
+            << "DtoH=" << dtoh_ms << " "
+            << "Total=" << total_ms << "\n";
+
+  std::cout << "Estimated device alloc bytes: " << alloc_bytes << "\n";
+  std::cout << "GPU mem free before: " << free0
+            << " free after: " << free1
+            << " total: " << total_mem << "\n";
+
   std::cout << "Output: " << (outExt == "ppm" ? p.ppmOutPath : args.outPath)
             << "\n";
+
+  // One parseable line for your Python grid search
+  std::cout
+      << "RESULT "
+      << "w=" << w << " "
+      << "h=" << h << " "
+      << "bx=" << args.bx << " "
+      << "by=" << args.by << " "
+      << "tpb=" << tpb << " "
+      << "gridx=" << grid.x << " "
+      << "gridy=" << grid.y << " "
+      << "mode=" << args.mode << " "
+      << "blur=" << (args.blur ? 1 : 0) << " "
+      << "passes=" << (args.blur ? args.blurPasses : 0) << " "
+      << "htod_ms=" << htod_ms << " "
+      << "kernel_ms=" << kernel_ms << " "
+      << "dtoh_ms=" << dtoh_ms << " "
+      << "total_ms=" << total_ms << " "
+      << "alloc_bytes=" << alloc_bytes << " "
+      << "free0=" << free0 << " "
+      << "free1=" << free1 << " "
+      << "total_mem=" << total_mem
+      << "\n";
 }
 
 
@@ -764,8 +807,26 @@ int main(int argc, char **argv) {
   DeviceBuffers buf;
   buf.bytes = bytes;
   buf.alloc(args.blur);
+  
+  size_t free0 = 0, total0 = 0, free1 = 0, total1 = 0;
+  CUDA_CHECK(cudaMemGetInfo(&free0, &total0));
+   CUDA_CHECK(cudaMemGetInfo(&free1, &total1));
 
+  // Timing buckets
+  cudaEvent_t e0, e1, e2, e3;
+  CUDA_CHECK(cudaEventCreate(&e0));
+  CUDA_CHECK(cudaEventCreate(&e1));
+  CUDA_CHECK(cudaEventCreate(&e2));
+  CUDA_CHECK(cudaEventCreate(&e3));
+
+  float htod_ms = 0.0f;
+  float dtoh_ms = 0.0f;
+
+  CUDA_CHECK(cudaEventRecord(e0));
   CUDA_CHECK(cudaMemcpy(buf.d_in, h_in.data(), bytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaEventRecord(e1));
+  CUDA_CHECK(cudaEventSynchronize(e1));
+  CUDA_CHECK(cudaEventElapsedTime(&htod_ms, e0, e1));
 
   dim3 block((unsigned)args.bx, (unsigned)args.by, 1);
   dim3 grid((unsigned)((w + args.bx - 1) / args.bx),
@@ -773,9 +834,19 @@ int main(int argc, char **argv) {
             1);
 
   const int modeInt = resolveModeInt(args.mode);
-  const float ms = runPipeline(args, buf, w, h, grid, block, modeInt);
+  const float kernel_ms = runPipeline(args, buf, w, h, grid, block, modeInt);
 
+
+  CUDA_CHECK(cudaEventRecord(e2));
   CUDA_CHECK(cudaMemcpy(h_out.data(), buf.d_out, bytes, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaEventRecord(e3));
+  CUDA_CHECK(cudaEventSynchronize(e3));
+  CUDA_CHECK(cudaEventElapsedTime(&dtoh_ms, e2, e3));
+  CUDA_CHECK(cudaMemGetInfo(&free1, &total1));
+  CUDA_CHECK(cudaEventDestroy(e0));
+  CUDA_CHECK(cudaEventDestroy(e1));
+  CUDA_CHECK(cudaEventDestroy(e2));
+  CUDA_CHECK(cudaEventDestroy(e3));
 
   if (!writePPM_P6(p.ppmOutPath, w, h, h_out.data())) {
     std::cerr << "Failed to write PPM: " << p.ppmOutPath << "\n";
@@ -783,7 +854,12 @@ int main(int argc, char **argv) {
   }
 
   convertOutputIfNeeded(p, outExt, args.outPath);
-  printRunSummary(args, w, h, grid, ms, outExt, p);
+
+  const size_t alloc_bytes = bytes * (args.blur ? 4u : 2u);
+  printRunSummary(args, w, h, grid,
+                htod_ms, kernel_ms, dtoh_ms,
+                alloc_bytes, free0, free1, total0,
+                outExt, p);
   cleanupTempsIfNeeded(args, p);
 
   return 0;
