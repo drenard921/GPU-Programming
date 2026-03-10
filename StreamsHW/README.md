@@ -304,7 +304,7 @@ Approximate throughput:
 
 Example kernel timing distribution:
 
-![Kernel breakdown]('plots/best_config_kernel_breakdown.png')
+![Kernel breakdown](plots/best_config_kernel_breakdown.png)
 
 Approximate timings:
 
