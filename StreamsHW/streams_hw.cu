@@ -1,15 +1,105 @@
-// streams_hw_cuda.cu
-// 2×3 panel viewer (RGB565 end-to-end)
-// Row 1 (GPU gamer upscale):   [FR up] [LG up]    (bilinear, CUDA streams)
-// Row 2 (control / raw):       [FR raw] [LG raw]  (nearest upscale for "pixel perfect")
-// Row 3 (data science stream): [FR bilinear vs nearest] [FR raw vs LG raw] (heatmaps)
+// Dylan Renard
+// EN.605.617 Introduction to GPU Programming (JHU)
+// Professor Chance Pascale
+// March 9th, 2026
 //
-// Controls:
-//   WASD = D-pad
-//   KP_4=A, KP_5=B
-//   KP_2=Start, KP_3=Select
-//   KP_7=L, KP_9=R
-//   ESC quits
+// CUDA Streams and Events Assignment
+// Dual GBA Emulator Frame Processing with Concurrent CUDA Streams
+//
+// Overview:
+// This program demonstrates practical usage of CUDA Streams and CUDA Events by
+// processing video frames from two Game Boy Advance emulator instances in parallel.
+// Each emulator produces RGB565 frames which are transferred to the GPU where
+// multiple CUDA kernels perform image upscaling, visual comparison, and metric
+// extraction in real time.
+//
+// The application renders a 2×3 visualization panel showing the GPU-processed
+// results while simultaneously collecting performance measurements for analysis.
+//
+// CUDA Concepts Demonstrated:
+//   • CUDA Streams      - Two independent streams process FireRed and LeafGreen
+//                         frames concurrently to illustrate asynchronous execution.
+//   • CUDA Events       - Kernel timing is measured using events to record
+//                         execution durations for key GPU operations.
+//   • Global Memory     - Frame buffers, intermediate images, and composite
+//                         display outputs reside in device global memory.
+//   • Registers         - Per-thread computations inside image processing kernels.
+//   • Atomic Operations - Used for reduction metrics (heatmap statistics).
+//
+// GPU Processing Pipeline:
+//   1. Two libretro emulator instances produce RGB565 video frames.
+//   2. Frames are copied Host → Device asynchronously on separate CUDA streams.
+//   3. Bilinear upscaling kernels run concurrently on each stream.
+//   4. Nearest-neighbor upscales are computed as control comparisons.
+//   5. Heatmap kernels compute visual differences between:
+//        • Bilinear vs nearest (self comparison)
+//        • FireRed vs LeafGreen frames (cross comparison)
+//   6. Reduction kernels compute summary metrics such as mean heatmap intensity
+//      and nonzero difference counts.
+//   7. A CUDA kernel composes the six processed panels into a single output frame.
+//   8. The composite image is copied Device → Host and rendered using SDL.
+//
+// Visualization Layout (2×3 Panel):
+//
+//   Row 1 – GPU Bilinear Upscaling
+//      [ FireRed Bilinear ]   [ LeafGreen Bilinear ]
+//
+//   Row 2 – Control Comparison (Nearest Neighbor)
+//      [ FireRed Nearest ]    [ LeafGreen Nearest ]
+//
+//   Row 3 – Data Analysis Views
+//      [ Bilinear vs Nearest Heatmap ]   [ FireRed vs LeafGreen Heatmap ]
+//
+// Performance Instrumentation:
+//   CUDA events measure kernel execution time for:
+//      • FireRed bilinear upscale
+//      • LeafGreen bilinear upscale
+//      • Self comparison heatmap
+//      • Cross-game difference heatmap
+//
+//   Metrics are logged per frame and written to a CSV file including:
+//      frame index, thread/block configuration,
+//      kernel timings, heatmap statistics,
+//      and pixel-level difference counts.
+//
+// Emulator Controls:
+//   Keyboard inputs are mapped to Game Boy Advance controls and applied
+//   simultaneously to both emulator instances so gameplay remains synchronized.
+//
+//      W  = D-Pad Up
+//      A  = D-Pad Left
+//      S  = D-Pad Down
+//      D  = D-Pad Right
+//
+//      Keypad 4 = A Button
+//      Keypad 5 = B Button
+//      Keypad 2 = Start
+//      Keypad 3 = Select
+//
+//      Keypad 7 = L Shoulder
+//      Keypad 9 = R Shoulder
+//
+//      ESC = Exit program
+//
+// Command-Line Usage:
+//   ./streams_hw
+//        [--core <mgba_libretro.so>]
+//        [--fr <FireRed.gba>]
+//        [--lg <LeafGreen.gba>]
+//        [--scale N]
+//        [--threads N]
+//        [--blocks N]
+//        [--frames N]
+//        [--print-every N]
+//        [--csv output.csv]
+//
+// Example:
+//   ./streams_hw --scale 3 --threads 256 --frames 1000
+//
+// Output:
+//   • Real-time SDL window displaying GPU processed frames.
+//   • CSV performance log for analysis of CUDA stream concurrency
+//     and kernel timing behavior.
 
 #include <fstream>
 #include <SDL2/SDL.h>
@@ -36,6 +126,20 @@
     throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err)); \
   } \
 } while(0)
+
+static constexpr int GBA_WIDTH = 240;
+static constexpr int GBA_HEIGHT = 160;
+static constexpr int DEFAULT_SCALE = 3;
+static constexpr int MIN_THREADS = 64;
+static constexpr int MAX_THREADS = 1024;
+static constexpr int DEFAULT_THREADS = 256;
+static constexpr int DEFAULT_PRINT_EVERY = 60;
+static constexpr int AUDIO_BUFFER_SAMPLES = 1024;
+static constexpr int DIFF_THRESHOLD = 8;
+static constexpr int HEAT_GAIN = 6;
+static constexpr int BLOCK2D_X = 16;
+static constexpr int BLOCK2D_Y = 16;
+
 
 // ---------------- Controls --------------------
 static uint32_t g_keys = 0;
@@ -135,6 +239,33 @@ static void sdl_audio_cb(void*, Uint8* stream, int len_bytes) {
 }
 
 // ---------------- Libretro callbacks --------------------
+/**
+ * @brief Video frame callback used by the emulator to deliver rendered frames.
+ *
+ * This function is invoked by the emulator core every time a new video frame
+ * is produced. It copies the raw frame buffer into a thread-local structure
+ * (`tls_current`) so that it can later be processed or transferred to GPU
+ * memory for CUDA-based post-processing (e.g., scaling or filtering).
+ *
+ * The incoming frame is stored in RGB565 format. Because the emulator may
+ * include padding between rows, the function copies the frame row-by-row
+ * using the provided pitch value.
+ *
+ * @param data   Pointer to the raw frame buffer produced by the emulator.
+ * @param width  Width of the frame in pixels.
+ * @param height Height of the frame in pixels.
+ * @param pitch  Number of bytes between the start of successive rows in the
+ *               source buffer. This may be larger than width * sizeof(uint16_t)
+ *               due to row padding.
+ *
+ * @note The frame data is copied into `tls_current->frame565`, which is resized
+ *       to match the current frame dimensions.
+ *
+ * @warning The function safely exits if:
+ *          - No thread-local context (`tls_current`) is available.
+ *          - The input frame pointer is null.
+ *          - The frame dimensions are invalid.
+ */
 static void video_refresh_cb(const void* data, unsigned width, unsigned height, size_t pitch) {
     if (!tls_current) return;
     if (!data || width == 0 || height == 0) return;
@@ -216,6 +347,44 @@ static RetroAPI load_retro_api(void* so) {
     return a;
 }
 
+
+/**
+ * @brief Creates and initializes a new emulator instance for a given ROM.
+ *
+ * This function dynamically loads a libretro emulator core and configures it
+ * to run a specific ROM. A new dynamic linker namespace is created using
+ * `dlmopen`, which allows multiple emulator cores to run simultaneously
+ * without symbol conflicts. This is important for scenarios where multiple
+ * emulation instances are executed concurrently (e.g., parallel execution
+ * using CUDA streams).
+ *
+ * After loading the core, the function retrieves the libretro API and registers
+ * all required callback functions for environment setup, video output, audio
+ * output, and input handling.
+ *
+ * The thread-local pointer `tls_current` is temporarily set to the newly created
+ * instance so that callback functions can correctly associate emulator events
+ * with the proper instance.
+ *
+ * Finally, the emulator core is initialized and the specified ROM is loaded.
+ *
+ * @param core_so  Path to the libretro core shared library (.so).
+ * @param rom_path Path to the ROM file that will be executed by the emulator.
+ *
+ * @return Instance A fully initialized emulator instance ready to run frames.
+ *
+ * @throws std::runtime_error If:
+ *         - The emulator core fails to load via `dlmopen`
+ *         - The ROM fails to load via `retro_load_game`
+ *
+ * @note `dlmopen` with `LM_ID_NEWLM` creates an isolated linker namespace,
+ *       allowing multiple emulator cores to be loaded independently in the
+ *       same process.
+ *
+ * @warning The thread-local pointer `tls_current` must be correctly set before
+ *          calling libretro initialization functions so callbacks operate on
+ *          the correct instance.
+ */
 static Instance make_instance(const std::string& core_so, const std::string& rom_path) {
     Instance inst;
     inst.rom_path = rom_path;
@@ -262,12 +431,52 @@ struct Args {
     std::string lg = "./GBAROMS/LeafGreen.gba";
     std::string csv = "streams_metrics.csv";
     int frames = -1;
-    int scale = 3;
-    int threads = 256;
+    int scale = DEFAULT_SCALE;
+    int threads = DEFAULT_THREADS;
     int blocks = 0;
-    int print_every = 60;
+    int print_every = DEFAULT_PRINT_EVERY;
 };
 
+
+
+/**
+ * @brief Parses command-line arguments for the emulator CUDA processing program.
+ *
+ * This function processes command-line parameters and stores them in an `Args`
+ * structure used to configure the emulator execution and CUDA kernel behavior.
+ * Supported options allow users to specify ROM paths, emulator cores, runtime
+ * parameters, CUDA execution settings, and output logging.
+ *
+ * Each argument that requires a value is validated using a helper lambda (`need`)
+ * which ensures a parameter follows the option flag.
+ *
+ * After parsing, several sanity checks are applied to enforce valid ranges for
+ * scaling factors, thread counts, and printing intervals.
+ *
+ * @param argc Number of command-line arguments.
+ * @param argv Array of command-line argument strings.
+ *
+ * @return Args Structure containing all parsed runtime configuration options.
+ *
+ * @throws std::runtime_error If:
+ *         - An argument requiring a value is missing one
+ *         - An unknown command-line argument is encountered
+ *
+ * @note Supported command-line arguments:
+ *       --core <file>        Path to the libretro core shared library
+ *       --fr / --rom1        Path to FireRed ROM
+ *       --lg / --rom2        Path to LeafGreen ROM
+ *       --frames <N>         Number of frames to process
+ *       --scale <S>          Upscaling factor applied by CUDA kernels
+ *       --threads <T>        Number of CUDA threads per block
+ *       --blocks <B>         Number of CUDA blocks (0 = automatic)
+ *       --print-every <N>    Interval for printing performance statistics
+ *       --csv <file>         Output CSV file for logging performance metrics
+ *       --help / -h          Display usage information
+ *
+ * @warning Thread counts are clamped between MIN_THREADS and MAX_THREADS to
+ *          prevent invalid CUDA kernel launch configurations.
+ */
 static Args parse_args(int argc, char** argv) {
     Args a;
     for (int i = 1; i < argc; i++) {
@@ -298,9 +507,9 @@ static Args parse_args(int argc, char** argv) {
         }
     }
     if (a.scale < 1) a.scale = 1;
-    if (a.threads < 64) a.threads = 64;
-    if (a.threads > 1024) a.threads = 1024;
-    if (a.print_every < 1) a.print_every = 60;
+    if (a.threads < MIN_THREADS) a.threads = MIN_THREADS;
+    if (a.threads > MAX_THREADS) a.threads = MAX_THREADS;
+    if (a.print_every < 1) a.print_every = DEFAULT_PRINT_EVERY;
     return a;
 }
 
@@ -335,6 +544,39 @@ __device__ __forceinline__ uint8_t luma8_from565(uint16_t p) {
 }
 
 // ---------------- CUDA kernels --------------------
+
+/**
+ * @brief CUDA kernel that performs bilinear upscaling of an RGB565 image.
+ *
+ * Each GPU thread computes one pixel of the output image by sampling four
+ * neighboring pixels from the input image and interpolating their color values
+ * using bilinear interpolation. The interpolation is performed in floating
+ * point space after unpacking the RGB565 color components.
+ *
+ * The kernel maps output pixel coordinates to corresponding fractional
+ * coordinates in the source image. The four nearest source pixels are then
+ * fetched, and horizontal and vertical interpolation weights are applied
+ * to compute the final color.
+ *
+ * The interpolated RGB values are finally packed back into RGB565 format and
+ * written to the destination image buffer.
+ *
+ * @param src Pointer to the source image in RGB565 format.
+ * @param iw  Width of the source image.
+ * @param ih  Height of the source image.
+ * @param dst Pointer to the destination (upscaled) image buffer in RGB565 format.
+ * @param ow  Width of the output image.
+ * @param oh  Height of the output image.
+ *
+ * @note Each thread processes exactly one output pixel using a 2D thread grid.
+ *       Threads that fall outside the output bounds exit immediately.
+ *
+ * @note RGB565 pixels are unpacked into floating-point RGB components for
+ *       interpolation and then repacked into RGB565 before storage.
+ *
+ * @warning Boundary coordinates are clamped to valid source image ranges to
+ *          prevent out-of-bounds memory accesses.
+ */
 __global__ void k_upscale_bilinear_565(const uint16_t* src, int iw, int ih,
                                        uint16_t* dst, int ow, int oh) {
     int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -377,6 +619,30 @@ __global__ void k_upscale_bilinear_565(const uint16_t* src, int iw, int ih,
     dst[y * ow + x] = pack565(r, g, b);
 }
 
+/**
+ * @brief CUDA kernel that performs nearest-neighbor upscaling of an RGB565 image.
+ *
+ * Each thread computes a single output pixel by mapping its coordinates to the
+ * corresponding location in the source image and copying the nearest pixel value.
+ * Unlike bilinear interpolation, this method does not blend neighboring pixels
+ * and therefore preserves the exact original pixel values.
+ *
+ * This kernel is primarily used as a control or reference scaling method to
+ * compare against higher-quality interpolation methods such as bilinear scaling.
+ *
+ * @param src Pointer to the source image in RGB565 format.
+ * @param iw  Width of the source image.
+ * @param ih  Height of the source image.
+ * @param dst Pointer to the destination (upscaled) image buffer in RGB565 format.
+ * @param ow  Width of the output image.
+ * @param oh  Height of the output image.
+ *
+ * @note Each thread computes exactly one output pixel using a 2D thread grid.
+ *       Threads that fall outside the image bounds exit immediately.
+ *
+ * @note Source coordinates are computed using integer scaling, ensuring
+ *       deterministic nearest-pixel selection.
+ */
 __global__ void k_upscale_nearest_565(const uint16_t* src, int iw, int ih,
                                       uint16_t* dst, int ow, int oh) {
     int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -398,22 +664,70 @@ __device__ __forceinline__ uint16_t heat565(uint8_t d) {
     return pack565(r, g, b);
 }
 
+
+/**
+ * @brief CUDA kernel that computes a per-pixel difference heatmap between two RGB565 images.
+ *
+ * Each thread processes one pixel index from two input images of equal size.
+ * The kernel converts both RGB565 pixels to luma values, computes the absolute
+ * luminance difference, amplifies that difference using a heatmap gain factor,
+ * and maps the result to a false-color RGB565 heatmap for visualization.
+ *
+ * This kernel is used for two comparison modes in the pipeline:
+ * - self comparison: bilinear upscale vs nearest-neighbor upscale
+ * - cross comparison: FireRed frame vs LeafGreen frame
+ *
+ * @param a   Pointer to the first input RGB565 image.
+ * @param b   Pointer to the second input RGB565 image.
+ * @param n   Number of pixels in each input image.
+ * @param out Pointer to the output RGB565 heatmap image.
+ *
+ * @note Each thread computes exactly one output pixel using a 1D launch layout.
+ *       Threads with index >= n exit immediately.
+ *
+ * @note The luminance difference is scaled by `HEAT_GAIN` and clamped to 255
+ *       before conversion to a false-color heatmap.
+ *
+ * @warning This kernel assumes both input images contain at least `n` pixels.
+ */
 __global__ void k_heatmap_diff_native(const uint16_t* a, const uint16_t* b, int n, uint16_t* out) {
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
     uint8_t ya = luma8_from565(a[i]);
     uint8_t yb = luma8_from565(b[i]);
     int dd = abs((int)ya - (int)yb);
-    dd = min(255, dd * 6);
+    dd = min(255, dd * HEAT_GAIN);
     out[i] = heat565((uint8_t)dd);
 }
 
+/**
+ * @brief Sums the luminance values of an RGB565 image on the GPU.
+ *
+ * Each thread converts one RGB565 pixel to an 8-bit luminance value and adds it
+ * to a device-wide accumulator using an atomic operation.
+ *
+ * @param img Pointer to the input RGB565 image.
+ * @param n   Number of pixels in the image.
+ * @param sum Pointer to the device accumulator storing the luminance sum.
+ */
 __global__ void k_sum_luma565(const uint16_t* img, int n, unsigned long long* sum) {
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
     atomicAdd(sum, (unsigned long long)luma8_from565(img[i]));
 }
 
+
+/**
+ * @brief Counts pixels in an RGB565 image whose luminance exceeds a threshold.
+ *
+ * Each thread converts one RGB565 pixel to luminance and increments a device
+ * counter if the luminance is greater than the specified threshold.
+ *
+ * @param img       Pointer to the input RGB565 image.
+ * @param n         Number of pixels in the image.
+ * @param threshold Luminance threshold for counting a pixel as nonzero/significant.
+ * @param count     Pointer to the device counter.
+ */
 __global__ void k_count_nonzero_diff(const uint16_t* img, int n, uint8_t threshold, unsigned int* count) {
     int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= n) return;
@@ -421,6 +735,36 @@ __global__ void k_count_nonzero_diff(const uint16_t* img, int n, uint8_t thresho
     if (y > threshold) atomicAdd(count, 1u);
 }
 
+/**
+ * @brief CUDA kernel that composes six image panels into a single 2×3 grid output image.
+ *
+ * Each thread computes one pixel in the final composite image. The output frame
+ * is organized as a grid containing six panels arranged in two columns and three
+ * rows. The kernel determines which source panel the current output pixel belongs
+ * to, computes the local coordinates within that panel, and copies the
+ * corresponding RGB565 pixel value into the output buffer.
+ *
+ * Panel layout:
+ *   Row 0: FireRed bilinear upscale | LeafGreen bilinear upscale
+ *   Row 1: FireRed nearest upscale  | LeafGreen nearest upscale
+ *   Row 2: Self-difference heatmap  | Cross-game difference heatmap
+ *
+ * @param p00 Pointer to the first panel (row 0, column 0).
+ * @param p10 Pointer to the second panel (row 0, column 1).
+ * @param p01 Pointer to the third panel (row 1, column 0).
+ * @param p11 Pointer to the fourth panel (row 1, column 1).
+ * @param p02 Pointer to the fifth panel (row 2, column 0).
+ * @param p12 Pointer to the sixth panel (row 2, column 1).
+ * @param ow  Width of each individual panel.
+ * @param oh  Height of each individual panel.
+ * @param out Pointer to the final composite RGB565 output buffer.
+ *
+ * @note The output resolution is (2 * ow) × (3 * oh).
+ *       Each thread writes exactly one output pixel.
+ *
+ * @warning Threads outside the composite image bounds exit immediately
+ *          to avoid invalid memory access.
+ */
 __global__ void k_compose_2x3(const uint16_t* p00, const uint16_t* p10,
                               const uint16_t* p01, const uint16_t* p11,
                               const uint16_t* p02, const uint16_t* p12,
@@ -448,19 +792,518 @@ __global__ void k_compose_2x3(const uint16_t* p00, const uint16_t* p10,
     out[y * W + x] = src[ly * ow + lx];
 }
 
+// ---------------- Main helpers --------------------
+
+struct Geometry {
+    int raw_w = GBA_WIDTH;
+    int raw_h = GBA_HEIGHT;
+    int scale = DEFAULT_SCALE;
+    int up_w = 0;
+    int up_h = 0;
+    int win_w = 0;
+    int win_h = 0;
+};
+
+struct FrameMetrics {
+    float fr_up_ms = 0.0f;
+    float lg_up_ms = 0.0f;
+    float self_diff_ms = 0.0f;
+    float cross_diff_ms = 0.0f;
+    double total_gpu_ms = 0.0;
+    double heat_self_mean = 0.0;
+    double heat_cross_mean = 0.0;
+    unsigned int nonzero_diff_pixels = 0;
+};
+
+struct SdlResources {
+    SDL_Window* window = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    SDL_Texture* texture = nullptr;
+};
+
+struct CudaResources {
+    uint16_t *fr_raw = nullptr, *lg_raw = nullptr;
+    uint16_t *fr_up = nullptr, *lg_up = nullptr;
+    uint16_t *fr_nearest = nullptr, *lg_nearest = nullptr;
+    uint16_t *heat_cross_native = nullptr;
+    uint16_t *heat_self = nullptr, *heat_cross = nullptr;
+    uint16_t *composite = nullptr;
+
+    unsigned long long *sum_self = nullptr, *sum_cross = nullptr;
+    unsigned int *count_cross = nullptr;
+
+    cudaStream_t fr_stream = nullptr;
+    cudaStream_t lg_stream = nullptr;
+
+    cudaEvent_t ev_fr_up_start = nullptr, ev_fr_up_end = nullptr;
+    cudaEvent_t ev_lg_up_start = nullptr, ev_lg_up_end = nullptr;
+    cudaEvent_t ev_self_start = nullptr, ev_self_end = nullptr;
+    cudaEvent_t ev_cross_start = nullptr, ev_cross_end = nullptr;
+    cudaEvent_t ev_frame_done = nullptr;
+};
+
+static Geometry make_geometry(int scale) {
+    Geometry g;
+    g.scale = scale;
+    g.up_w = g.raw_w * g.scale;
+    g.up_h = g.raw_h * g.scale;
+    g.win_w = 2 * g.up_w;
+    g.win_h = 3 * g.up_h;
+    return g;
+}
+
+static void write_csv_header(std::ofstream& csv) {
+    csv << "frame,threads,blocks,fr_up_ms,lg_up_ms,self_diff_ms,cross_diff_ms,"
+           "total_gpu_ms,heat_self_mean,heat_cross_mean,nonzero_diff_pixels\n";
+}
+
+static void write_csv_row(std::ofstream& csv,
+                          int frame_idx,
+                          int threads,
+                          int blocks,
+                          const FrameMetrics& metrics) {
+    csv << frame_idx << ","
+        << threads << ","
+        << blocks << ","
+        << metrics.fr_up_ms << ","
+        << metrics.lg_up_ms << ","
+        << metrics.self_diff_ms << ","
+        << metrics.cross_diff_ms << ","
+        << metrics.total_gpu_ms << ","
+        << metrics.heat_self_mean << ","
+        << metrics.heat_cross_mean << ","
+        << metrics.nonzero_diff_pixels << "\n";
+}
+
+static void print_metrics(int frame_idx,
+                          int threads,
+                          int blocks,
+                          const FrameMetrics& metrics) {
+    std::cout << "[frame " << frame_idx << "] "
+              << "threads=" << threads
+              << " blocks=" << blocks
+              << " fr_up_ms=" << metrics.fr_up_ms
+              << " lg_up_ms=" << metrics.lg_up_ms
+              << " self_diff_ms=" << metrics.self_diff_ms
+              << " cross_diff_ms=" << metrics.cross_diff_ms
+              << " total_gpu_ms=" << metrics.total_gpu_ms
+              << " heat_self_mean=" << metrics.heat_self_mean
+              << " heat_cross_mean=" << metrics.heat_cross_mean
+              << " nonzero_diff_pixels=" << metrics.nonzero_diff_pixels
+              << "\n";
+}
+
+static void init_audio(const retro_system_av_info& av) {
+    SDL_AudioSpec want{};
+    want.freq = (int)av.timing.sample_rate;
+    want.format = AUDIO_S16SYS;
+    want.channels = 2;
+    want.samples = AUDIO_BUFFER_SAMPLES;
+    want.callback = sdl_audio_cb;
+
+    SDL_AudioSpec have{};
+    g_audio_dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (!g_audio_dev) {
+        std::cerr << "WARN: SDL_OpenAudioDevice failed: " << SDL_GetError() << "\n";
+        return;
+    }
+
+    size_t ring_samples = (size_t)have.freq * (size_t)have.channels / 2;
+    g_audio_ring.assign(ring_samples, 0);
+    g_audio_r = g_audio_w = 0;
+    SDL_PauseAudioDevice(g_audio_dev, 0);
+}
+
+static void shutdown_audio() {
+    if (g_audio_dev) {
+        SDL_CloseAudioDevice(g_audio_dev);
+        g_audio_dev = 0;
+    }
+}
+
+static void init_sdl_resources(const Geometry& geom, SdlResources& sdl) {
+    sdl.window = SDL_CreateWindow(
+        "StreamsHW CUDA (2x3 panels, RGB565)",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        geom.win_w, geom.win_h,
+        SDL_WINDOW_SHOWN
+    );
+    if (!sdl.window) {
+        throw std::runtime_error(std::string("SDL_CreateWindow failed: ") + SDL_GetError());
+    }
+
+    sdl.renderer = SDL_CreateRenderer(sdl.window, -1, SDL_RENDERER_ACCELERATED);
+    if (!sdl.renderer) {
+        throw std::runtime_error(std::string("SDL_CreateRenderer failed: ") + SDL_GetError());
+    }
+
+    sdl.texture = SDL_CreateTexture(
+        sdl.renderer,
+        SDL_PIXELFORMAT_RGB565,
+        SDL_TEXTUREACCESS_STREAMING,
+        geom.win_w,
+        geom.win_h
+    );
+    if (!sdl.texture) {
+        throw std::runtime_error(std::string("SDL_CreateTexture failed: ") + SDL_GetError());
+    }
+}
+
+static void destroy_sdl_resources(SdlResources& sdl) {
+    if (sdl.texture) SDL_DestroyTexture(sdl.texture);
+    if (sdl.renderer) SDL_DestroyRenderer(sdl.renderer);
+    if (sdl.window) SDL_DestroyWindow(sdl.window);
+    sdl.texture = nullptr;
+    sdl.renderer = nullptr;
+    sdl.window = nullptr;
+}
+
+
+/**
+ * @brief Allocates GPU memory, CUDA streams, and CUDA events required for frame processing.
+ *
+ * This function initializes all CUDA resources needed to process emulator frames
+ * on the GPU. Memory buffers are allocated for raw emulator output, upscaled
+ * frames, intermediate processing results (e.g., nearest-neighbor scaling and
+ * heatmaps), and the final composited output frame.
+ *
+ * Device-side accumulators used for statistical analysis are also allocated.
+ * These track values such as self-similarity and cross-frame differences that
+ * may be used for performance metrics or divergence analysis between emulator
+ * instances.
+ *
+ * In addition to memory allocation, two CUDA streams are created to allow
+ * concurrent GPU execution for separate emulator instances (e.g., FireRed
+ * and LeafGreen). CUDA events are also initialized to measure kernel timing
+ * and coordinate execution between stages of the GPU pipeline.
+ *
+ * @param gpu  Structure that stores all CUDA device pointers, streams, and events.
+ * @param geom Structure describing the geometry of the frame buffers, including
+ *             raw frame dimensions, upscaled frame dimensions, and window size.
+ *
+ * @note Memory buffers are sized according to three pixel resolutions:
+ *       - raw_pixels: native emulator resolution
+ *       - up_pixels:  resolution after GPU upscaling
+ *       - win_pixels: resolution of the final composited display window
+ *
+ * @warning All allocations use CUDA_CHECK to ensure runtime errors are caught
+ *          immediately if device memory allocation fails.
+ */
+static void allocate_cuda_resources(CudaResources& gpu, const Geometry& geom) {
+    const size_t raw_pixels = (size_t)geom.raw_w * (size_t)geom.raw_h;
+    const size_t up_pixels  = (size_t)geom.up_w * (size_t)geom.up_h;
+    const size_t win_pixels = (size_t)geom.win_w * (size_t)geom.win_h;
+
+    CUDA_CHECK(cudaMalloc(&gpu.fr_raw, raw_pixels * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&gpu.lg_raw, raw_pixels * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&gpu.fr_up, up_pixels * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&gpu.lg_up, up_pixels * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&gpu.fr_nearest, up_pixels * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&gpu.lg_nearest, up_pixels * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&gpu.heat_cross_native, raw_pixels * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&gpu.heat_self, up_pixels * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&gpu.heat_cross, up_pixels * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&gpu.composite, win_pixels * sizeof(uint16_t)));
+
+    CUDA_CHECK(cudaMalloc(&gpu.sum_self, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&gpu.sum_cross, sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&gpu.count_cross, sizeof(unsigned int)));
+
+    CUDA_CHECK(cudaStreamCreate(&gpu.fr_stream));
+    CUDA_CHECK(cudaStreamCreate(&gpu.lg_stream));
+
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_fr_up_start));
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_fr_up_end));
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_lg_up_start));
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_lg_up_end));
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_self_start));
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_self_end));
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_cross_start));
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_cross_end));
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_frame_done));
+}
+
+static void destroy_cuda_resources(CudaResources& gpu) {
+    if (gpu.ev_fr_up_start) CUDA_CHECK(cudaEventDestroy(gpu.ev_fr_up_start));
+    if (gpu.ev_fr_up_end)   CUDA_CHECK(cudaEventDestroy(gpu.ev_fr_up_end));
+    if (gpu.ev_lg_up_start) CUDA_CHECK(cudaEventDestroy(gpu.ev_lg_up_start));
+    if (gpu.ev_lg_up_end)   CUDA_CHECK(cudaEventDestroy(gpu.ev_lg_up_end));
+    if (gpu.ev_self_start)  CUDA_CHECK(cudaEventDestroy(gpu.ev_self_start));
+    if (gpu.ev_self_end)    CUDA_CHECK(cudaEventDestroy(gpu.ev_self_end));
+    if (gpu.ev_cross_start) CUDA_CHECK(cudaEventDestroy(gpu.ev_cross_start));
+    if (gpu.ev_cross_end)   CUDA_CHECK(cudaEventDestroy(gpu.ev_cross_end));
+    if (gpu.ev_frame_done)  CUDA_CHECK(cudaEventDestroy(gpu.ev_frame_done));
+
+    if (gpu.fr_stream) CUDA_CHECK(cudaStreamDestroy(gpu.fr_stream));
+    if (gpu.lg_stream) CUDA_CHECK(cudaStreamDestroy(gpu.lg_stream));
+
+    if (gpu.fr_raw) CUDA_CHECK(cudaFree(gpu.fr_raw));
+    if (gpu.lg_raw) CUDA_CHECK(cudaFree(gpu.lg_raw));
+    if (gpu.fr_up) CUDA_CHECK(cudaFree(gpu.fr_up));
+    if (gpu.lg_up) CUDA_CHECK(cudaFree(gpu.lg_up));
+    if (gpu.fr_nearest) CUDA_CHECK(cudaFree(gpu.fr_nearest));
+    if (gpu.lg_nearest) CUDA_CHECK(cudaFree(gpu.lg_nearest));
+    if (gpu.heat_cross_native) CUDA_CHECK(cudaFree(gpu.heat_cross_native));
+    if (gpu.heat_self) CUDA_CHECK(cudaFree(gpu.heat_self));
+    if (gpu.heat_cross) CUDA_CHECK(cudaFree(gpu.heat_cross));
+    if (gpu.composite) CUDA_CHECK(cudaFree(gpu.composite));
+
+    if (gpu.sum_self) CUDA_CHECK(cudaFree(gpu.sum_self));
+    if (gpu.sum_cross) CUDA_CHECK(cudaFree(gpu.sum_cross));
+    if (gpu.count_cross) CUDA_CHECK(cudaFree(gpu.count_cross));
+
+    gpu = CudaResources{};
+}
+
+static bool instances_have_valid_frames(const Instance& fire_red,
+                                        const Instance& leaf_green,
+                                        const Geometry& geom) {
+    const size_t raw_pixels = (size_t)geom.raw_w * (size_t)geom.raw_h;
+    return fire_red.w == (unsigned)geom.raw_w &&
+           fire_red.h == (unsigned)geom.raw_h &&
+           fire_red.frame565.size() >= raw_pixels &&
+           leaf_green.w == (unsigned)geom.raw_w &&
+           leaf_green.h == (unsigned)geom.raw_h &&
+           leaf_green.frame565.size() >= raw_pixels;
+}
+
+static void render_composite_texture(SDL_Texture* texture,
+                                     SDL_Renderer* renderer,
+                                     const std::vector<uint16_t>& host_composite_rgb565,
+                                     const Geometry& geom) {
+    void* pixels = nullptr;
+    int pitch_bytes = 0;
+    if (SDL_LockTexture(texture, nullptr, &pixels, &pitch_bytes) == 0) {
+        for (int y = 0; y < geom.win_h; y++) {
+            std::memcpy(
+                (uint8_t*)pixels + (size_t)y * (size_t)pitch_bytes,
+                &host_composite_rgb565[(size_t)y * (size_t)geom.win_w],
+                (size_t)geom.win_w * sizeof(uint16_t)
+            );
+        }
+        SDL_UnlockTexture(texture);
+    }
+
+    SDL_RenderClear(renderer);
+    SDL_RenderCopy(renderer, texture, nullptr, nullptr);
+    SDL_RenderPresent(renderer);
+}
+
+
+/**
+ * @brief Collects timing and statistical metrics from GPU processing for a single frame.
+ *
+ * This function gathers performance measurements and computed statistics from the
+ * GPU after a frame has completed processing. CUDA events are used to measure the
+ * execution time of different kernel stages, including upscaling for each emulator
+ * instance and difference computations between frames.
+ *
+ * In addition to timing metrics, device-side accumulators are copied back to the
+ * host to compute summary statistics such as average self-difference, average
+ * cross-difference between emulator frames, and the number of pixels with
+ * non-zero differences.
+ *
+ * These metrics are used for runtime monitoring, performance analysis, and
+ * potential logging to CSV for experimental evaluation.
+ *
+ * @param gpu  Structure containing CUDA device pointers, streams, and timing events.
+ * @param geom Geometry structure describing the dimensions of the processed frames.
+ *
+ * @return FrameMetrics Structure containing kernel execution times, heatmap
+ *         statistics, total GPU time for the frame, and divergence metrics.
+ *
+ * @note CUDA events measure elapsed time in milliseconds between recorded start
+ *       and end points for each kernel stage.
+ *
+ * @warning Device accumulators must be copied back to host memory using
+ *          cudaMemcpy before computing aggregate statistics.
+ */
+static FrameMetrics collect_frame_metrics(const CudaResources& gpu,
+                                          const Geometry& geom) {
+    FrameMetrics metrics{};
+
+    CUDA_CHECK(cudaEventElapsedTime(&metrics.fr_up_ms, gpu.ev_fr_up_start, gpu.ev_fr_up_end));
+    CUDA_CHECK(cudaEventElapsedTime(&metrics.lg_up_ms, gpu.ev_lg_up_start, gpu.ev_lg_up_end));
+    CUDA_CHECK(cudaEventElapsedTime(&metrics.self_diff_ms, gpu.ev_self_start, gpu.ev_self_end));
+    CUDA_CHECK(cudaEventElapsedTime(&metrics.cross_diff_ms, gpu.ev_cross_start, gpu.ev_cross_end));
+
+    unsigned long long h_sum_self = 0;
+    unsigned long long h_sum_cross = 0;
+    unsigned int h_count_cross = 0;
+
+    CUDA_CHECK(cudaMemcpy(&h_sum_self, gpu.sum_self, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_sum_cross, gpu.sum_cross, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_count_cross, gpu.count_cross, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+
+    const double up_pixels = (double)geom.up_w * (double)geom.up_h;
+    metrics.heat_self_mean = (double)h_sum_self / up_pixels;
+    metrics.heat_cross_mean = (double)h_sum_cross / up_pixels;
+    metrics.total_gpu_ms = std::max(
+        std::max((double)metrics.fr_up_ms, (double)metrics.lg_up_ms),
+        std::max((double)metrics.self_diff_ms, (double)metrics.cross_diff_ms)
+    );
+    metrics.nonzero_diff_pixels = h_count_cross;
+
+    return metrics;
+}
+
+
+/**
+ * @brief Executes the full GPU processing pipeline for one synchronized emulator frame pair.
+ *
+ * This function transfers the current FireRed and LeafGreen emulator frames to
+ * device memory, launches CUDA kernels to upscale and compare them, computes
+ * frame-level difference metrics, composes a multi-panel visualization, and
+ * copies the final composite image back to host memory for display.
+ *
+ * The pipeline uses two CUDA streams so that the FireRed and LeafGreen frame
+ * upscaling stages can run concurrently. Subsequent analysis and composition
+ * stages are coordinated with CUDA events to preserve dependencies while still
+ * exposing overlap where possible.
+ *
+ * Processing stages include:
+ * - asynchronous host-to-device copies of both raw RGB565 emulator frames
+ * - bilinear upscaling of both games on separate CUDA streams
+ * - nearest-neighbor upscaling for visual comparison
+ * - heatmap generation for bilinear-vs-nearest self-difference
+ * - heatmap generation for FireRed-vs-LeafGreen cross-difference
+ * - reduction kernels for mean-difference and changed-pixel statistics
+ * - composition of six output panels into a single display image
+ * - asynchronous device-to-host copy of the final composite frame
+ *
+ * @param fire_red  Emulator instance containing the current FireRed frame.
+ * @param leaf_green Emulator instance containing the current LeafGreen frame.
+ * @param geom      Geometry information for raw, upscaled, and output frame sizes.
+ * @param args      Runtime parameters controlling thread/block configuration.
+ * @param gpu       CUDA buffers, streams, and events used by the processing pipeline.
+ * @param host_composite_rgb565 Host-side output buffer that receives the final
+ *                              composited RGB565 frame.
+ *
+ * @note The function uses:
+ *       - 2D launch geometry for image-space kernels
+ *       - 1D launch geometry for reduction and per-pixel metric kernels
+ *       - CUDA events for timing and stream coordination
+ *
+ * @warning This function assumes all device memory, CUDA streams, and CUDA
+ *          events in `gpu` have already been allocated and initialized.
+ */
+static void process_gpu_frame(const Instance& fire_red,
+                              const Instance& leaf_green,
+                              const Geometry& geom,
+                              const Args& args,
+                              CudaResources& gpu,
+                              std::vector<uint16_t>& host_composite_rgb565) {
+    auto grid2 = [](int w, int h, dim3 block) {
+        return dim3(
+            (w + (int)block.x - 1) / (int)block.x,
+            (h + (int)block.y - 1) / (int)block.y,
+            1
+        );
+    };
+
+    const dim3 block2(BLOCK2D_X, BLOCK2D_Y, 1);
+    const int threads1 = args.threads;
+    const int blocks1_native = args.blocks > 0 ? args.blocks : (geom.raw_w * geom.raw_h + threads1 - 1) / threads1;
+    const int blocks1_scaled = args.blocks > 0 ? args.blocks : (geom.up_w * geom.up_h + threads1 - 1) / threads1;
+
+    // Copy raw emulator frames to GPU.
+    CUDA_CHECK(cudaMemcpyAsync(
+        gpu.fr_raw, fire_red.frame565.data(),
+        (size_t)geom.raw_w * (size_t)geom.raw_h * sizeof(uint16_t),
+        cudaMemcpyHostToDevice, gpu.fr_stream
+    ));
+    CUDA_CHECK(cudaMemcpyAsync(
+        gpu.lg_raw, leaf_green.frame565.data(),
+        (size_t)geom.raw_w * (size_t)geom.raw_h * sizeof(uint16_t),
+        cudaMemcpyHostToDevice, gpu.lg_stream
+    ));
+
+    // Timed region 1: FireRed bilinear upscale on its own CUDA stream.
+    CUDA_CHECK(cudaEventRecord(gpu.ev_fr_up_start, gpu.fr_stream));
+    k_upscale_bilinear_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.fr_stream>>>(
+        gpu.fr_raw, geom.raw_w, geom.raw_h, gpu.fr_up, geom.up_w, geom.up_h
+    );
+    CUDA_CHECK(cudaEventRecord(gpu.ev_fr_up_end, gpu.fr_stream));
+
+    // Timed region 2: LeafGreen bilinear upscale on its own CUDA stream.
+    CUDA_CHECK(cudaEventRecord(gpu.ev_lg_up_start, gpu.lg_stream));
+    k_upscale_bilinear_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.lg_stream>>>(
+        gpu.lg_raw, geom.raw_w, geom.raw_h, gpu.lg_up, geom.up_w, geom.up_h
+    );
+    CUDA_CHECK(cudaEventRecord(gpu.ev_lg_up_end, gpu.lg_stream));
+
+    // Control row: nearest-neighbor upscales for comparison.
+    k_upscale_nearest_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.fr_stream>>>(
+        gpu.fr_raw, geom.raw_w, geom.raw_h, gpu.fr_nearest, geom.up_w, geom.up_h
+    );
+    k_upscale_nearest_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.lg_stream>>>(
+        gpu.lg_raw, geom.raw_w, geom.raw_h, gpu.lg_nearest, geom.up_w, geom.up_h
+    );
+
+    // Timed region 3: FireRed bilinear vs nearest heatmap in display space.
+    CUDA_CHECK(cudaEventRecord(gpu.ev_self_start, gpu.fr_stream));
+    k_heatmap_diff_native<<<blocks1_scaled, threads1, 0, gpu.fr_stream>>>(
+        gpu.fr_up, gpu.fr_nearest, geom.up_w * geom.up_h, gpu.heat_self
+    );
+    CUDA_CHECK(cudaEventRecord(gpu.ev_self_end, gpu.fr_stream));
+
+    // Timed region 4: FireRed vs LeafGreen source difference heatmap.
+    CUDA_CHECK(cudaStreamWaitEvent(gpu.fr_stream, gpu.ev_lg_up_end, 0));
+    CUDA_CHECK(cudaEventRecord(gpu.ev_cross_start, gpu.fr_stream));
+    k_heatmap_diff_native<<<blocks1_native, threads1, 0, gpu.fr_stream>>>(
+        gpu.fr_raw, gpu.lg_raw, geom.raw_w * geom.raw_h, gpu.heat_cross_native
+    );
+    k_upscale_nearest_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.fr_stream>>>(
+        gpu.heat_cross_native, geom.raw_w, geom.raw_h, gpu.heat_cross, geom.up_w, geom.up_h
+    );
+    CUDA_CHECK(cudaEventRecord(gpu.ev_cross_end, gpu.fr_stream));
+
+    // Metric reductions.
+    CUDA_CHECK(cudaMemsetAsync(gpu.sum_self, 0, sizeof(unsigned long long), gpu.fr_stream));
+    CUDA_CHECK(cudaMemsetAsync(gpu.sum_cross, 0, sizeof(unsigned long long), gpu.fr_stream));
+    CUDA_CHECK(cudaMemsetAsync(gpu.count_cross, 0, sizeof(unsigned int), gpu.fr_stream));
+
+    k_sum_luma565<<<blocks1_scaled, threads1, 0, gpu.fr_stream>>>(
+        gpu.heat_self, geom.up_w * geom.up_h, gpu.sum_self
+    );
+    k_sum_luma565<<<blocks1_scaled, threads1, 0, gpu.fr_stream>>>(
+        gpu.heat_cross, geom.up_w * geom.up_h, gpu.sum_cross
+    );
+    k_count_nonzero_diff<<<blocks1_scaled, threads1, 0, gpu.fr_stream>>>(
+        gpu.heat_cross, geom.up_w * geom.up_h, DIFF_THRESHOLD, gpu.count_cross
+    );
+
+    // Compose the six panels into one RGB565 output image.
+    k_compose_2x3<<<grid2(geom.win_w, geom.win_h, block2), block2, 0, gpu.fr_stream>>>(
+        gpu.fr_up, gpu.lg_up,
+        gpu.fr_nearest, gpu.lg_nearest,
+        gpu.heat_self, gpu.heat_cross,
+        geom.up_w, geom.up_h,
+        gpu.composite
+    );
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        host_composite_rgb565.data(), gpu.composite,
+        (size_t)geom.win_w * (size_t)geom.win_h * sizeof(uint16_t),
+        cudaMemcpyDeviceToHost, gpu.fr_stream
+    ));
+
+    CUDA_CHECK(cudaEventRecord(gpu.ev_frame_done, gpu.fr_stream));
+    CUDA_CHECK(cudaEventSynchronize(gpu.ev_frame_done));
+}
+
 // ---------------- Main --------------------
 int main(int argc, char** argv) {
     try {
         Args args = parse_args(argc, argv);
 
-        Instance A = make_instance(args.core_so, args.fr);
-        Instance B = make_instance(args.core_so, args.lg);
-
-        g_audio_source = &A;
+        Instance fire_red = make_instance(args.core_so, args.fr);
+        Instance leaf_green = make_instance(args.core_so, args.lg);
+        g_audio_source = &fire_red;
 
         retro_system_av_info av{};
-        tls_current = &A;
-        A.api.retro_get_system_av_info(&av);
+        tls_current = &fire_red;
+        fire_red.api.retro_get_system_av_info(&av);
         tls_current = nullptr;
 
         const double target_fps = (av.timing.fps > 1.0) ? av.timing.fps : 59.7275;
@@ -471,114 +1314,30 @@ int main(int argc, char** argv) {
             throw std::runtime_error(std::string("SDL_Init failed: ") + SDL_GetError());
         }
 
-        SDL_AudioSpec want{};
-        want.freq = (int)av.timing.sample_rate;
-        want.format = AUDIO_S16SYS;
-        want.channels = 2;
-        want.samples = 1024;
-        want.callback = sdl_audio_cb;
+        init_audio(av);
 
-        SDL_AudioSpec have{};
-        g_audio_dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
-        if (!g_audio_dev) {
-            std::cerr << "WARN: SDL_OpenAudioDevice failed: " << SDL_GetError() << "\n";
-        } else {
-            size_t ring_samples = (size_t)have.freq * (size_t)have.channels / 2;
-            g_audio_ring.assign(ring_samples, 0);
-            g_audio_r = g_audio_w = 0;
-            SDL_PauseAudioDevice(g_audio_dev, 0);
-        }
+        Geometry geom = make_geometry(args.scale);
 
-        const int W = 240, H = 160;
-        const int S = args.scale;
-        const int OW = W * S;
-        const int OH = H * S;
-        const int WIN_W = 2 * OW;
-        const int WIN_H = 3 * OH;
+        SdlResources sdl{};
+        init_sdl_resources(geom, sdl);
 
-        SDL_Window* win = SDL_CreateWindow(
-            "StreamsHW CUDA (2x3 panels, RGB565)",
-            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-            WIN_W, WIN_H,
-            SDL_WINDOW_SHOWN
+        std::vector<uint16_t> host_composite_rgb565(
+            (size_t)geom.win_w * (size_t)geom.win_h, 0
         );
-        if (!win) throw std::runtime_error(std::string("SDL_CreateWindow failed: ") + SDL_GetError());
-
-        SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
-        if (!ren) throw std::runtime_error(std::string("SDL_CreateRenderer failed: ") + SDL_GetError());
-
-        SDL_Texture* tex = SDL_CreateTexture(
-            ren, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_STREAMING, WIN_W, WIN_H
-        );
-        if (!tex) throw std::runtime_error(std::string("SDL_CreateTexture failed: ") + SDL_GetError());
-
-        std::vector<uint16_t> h_composite((size_t)WIN_W * (size_t)WIN_H, 0);
 
         std::ofstream csv(args.csv);
         if (!csv) {
             throw std::runtime_error("Failed to open CSV output file: " + args.csv);
         }
-        csv << "frame,threads,blocks,fr_up_ms,lg_up_ms,self_diff_ms,cross_diff_ms,total_gpu_ms,heat_self_mean,heat_cross_mean,nonzero_diff_pixels\n";
+        write_csv_header(csv);
 
-        // CUDA buffers
-        uint16_t *d_fr_raw = nullptr, *d_lg_raw = nullptr;
-        uint16_t *d_fr_up = nullptr, *d_lg_up = nullptr;
-        uint16_t *d_fr_ctl = nullptr, *d_lg_ctl = nullptr;
-        uint16_t *d_heat_cross_native = nullptr;
-        uint16_t *d_heat_self = nullptr, *d_heat_cross = nullptr;
-        uint16_t *d_composite = nullptr;
+        CudaResources gpu{};
+        allocate_cuda_resources(gpu, geom);
 
-        unsigned long long *d_sum_self = nullptr, *d_sum_cross = nullptr;
-        unsigned int *d_count_cross = nullptr;
-
-        CUDA_CHECK(cudaMalloc(&d_fr_raw, (size_t)W * H * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&d_lg_raw, (size_t)W * H * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&d_fr_up, (size_t)OW * OH * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&d_lg_up, (size_t)OW * OH * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&d_fr_ctl, (size_t)OW * OH * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&d_lg_ctl, (size_t)OW * OH * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&d_heat_cross_native, (size_t)W * H * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&d_heat_self, (size_t)OW * OH * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&d_heat_cross, (size_t)OW * OH * sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc(&d_composite, (size_t)WIN_W * WIN_H * sizeof(uint16_t)));
-
-        CUDA_CHECK(cudaMalloc(&d_sum_self, sizeof(unsigned long long)));
-        CUDA_CHECK(cudaMalloc(&d_sum_cross, sizeof(unsigned long long)));
-        CUDA_CHECK(cudaMalloc(&d_count_cross, sizeof(unsigned int)));
-
-        cudaStream_t sFR, sLG;
-        CUDA_CHECK(cudaStreamCreate(&sFR));
-        CUDA_CHECK(cudaStreamCreate(&sLG));
-
-        cudaEvent_t evFRUp0, evFRUp1;
-        cudaEvent_t evLGUp0, evLGUp1;
-        cudaEvent_t evSelf0, evSelf1;
-        cudaEvent_t evCross0, evCross1;
-        cudaEvent_t evAll;
-
-        CUDA_CHECK(cudaEventCreate(&evFRUp0));
-        CUDA_CHECK(cudaEventCreate(&evFRUp1));
-        CUDA_CHECK(cudaEventCreate(&evLGUp0));
-        CUDA_CHECK(cudaEventCreate(&evLGUp1));
-        CUDA_CHECK(cudaEventCreate(&evSelf0));
-        CUDA_CHECK(cudaEventCreate(&evSelf1));
-        CUDA_CHECK(cudaEventCreate(&evCross0));
-        CUDA_CHECK(cudaEventCreate(&evCross1));
-        CUDA_CHECK(cudaEventCreate(&evAll));
-
-        auto grid2 = [&](int w, int h, dim3 block) {
-            return dim3(
-                (w + (int)block.x - 1) / (int)block.x,
-                (h + (int)block.y - 1) / (int)block.y,
-                1
-            );
-        };
-
-        dim3 block2(16, 16, 1);
-
-        int threads1 = args.threads;
-        int blocks1_native = args.blocks > 0 ? args.blocks : (W * H + threads1 - 1) / threads1;
-        int blocks1_scaled = args.blocks > 0 ? args.blocks : (OW * OH + threads1 - 1) / threads1;
+        const int threads_used = args.threads;
+        const int blocks_used = args.blocks > 0
+            ? args.blocks
+            : (geom.raw_w * geom.raw_h + threads_used - 1) / threads_used;
 
         bool running = true;
         int frame_idx = 0;
@@ -592,176 +1351,49 @@ int main(int argc, char** argv) {
 
             g_keys = build_synced_keymask_from_sdl();
 
-            tls_current = &A; A.api.retro_run();
-            tls_current = &B; B.api.retro_run();
+            tls_current = &fire_red;
+            fire_red.api.retro_run();
+            tls_current = &leaf_green;
+            leaf_green.api.retro_run();
             tls_current = nullptr;
 
-            if (A.w != (unsigned)W || A.h != (unsigned)H || A.frame565.size() < (size_t)W * H) continue;
-            if (B.w != (unsigned)W || B.h != (unsigned)H || B.frame565.size() < (size_t)W * H) continue;
+            if (!instances_have_valid_frames(fire_red, leaf_green, geom)) {
+                continue;
+            }
 
-            CUDA_CHECK(cudaMemcpyAsync(
-                d_fr_raw, A.frame565.data(), (size_t)W * H * sizeof(uint16_t),
-                cudaMemcpyHostToDevice, sFR
-            ));
-            CUDA_CHECK(cudaMemcpyAsync(
-                d_lg_raw, B.frame565.data(), (size_t)W * H * sizeof(uint16_t),
-                cudaMemcpyHostToDevice, sLG
-            ));
+            process_gpu_frame(fire_red, leaf_green, geom, args, gpu, host_composite_rgb565);
 
-            CUDA_CHECK(cudaEventRecord(evFRUp0, sFR));
-            k_upscale_bilinear_565<<<grid2(OW, OH, block2), block2, 0, sFR>>>(d_fr_raw, W, H, d_fr_up, OW, OH);
-            CUDA_CHECK(cudaEventRecord(evFRUp1, sFR));
-
-            CUDA_CHECK(cudaEventRecord(evLGUp0, sLG));
-            k_upscale_bilinear_565<<<grid2(OW, OH, block2), block2, 0, sLG>>>(d_lg_raw, W, H, d_lg_up, OW, OH);
-            CUDA_CHECK(cudaEventRecord(evLGUp1, sLG));
-
-            k_upscale_nearest_565<<<grid2(OW, OH, block2), block2, 0, sFR>>>(d_fr_raw, W, H, d_fr_ctl, OW, OH);
-            k_upscale_nearest_565<<<grid2(OW, OH, block2), block2, 0, sLG>>>(d_lg_raw, W, H, d_lg_ctl, OW, OH);
-
-            CUDA_CHECK(cudaEventRecord(evSelf0, sFR));
-            k_heatmap_diff_native<<<blocks1_scaled, threads1, 0, sFR>>>(d_fr_up, d_fr_ctl, OW * OH, d_heat_self);
-            CUDA_CHECK(cudaEventRecord(evSelf1, sFR));
-
-            CUDA_CHECK(cudaStreamWaitEvent(sFR, evLGUp1, 0));
-            CUDA_CHECK(cudaEventRecord(evCross0, sFR));
-            k_heatmap_diff_native<<<blocks1_native, threads1, 0, sFR>>>(d_fr_raw, d_lg_raw, W * H, d_heat_cross_native);
-            k_upscale_nearest_565<<<grid2(OW, OH, block2), block2, 0, sFR>>>(d_heat_cross_native, W, H, d_heat_cross, OW, OH);
-            CUDA_CHECK(cudaEventRecord(evCross1, sFR));
-
-            CUDA_CHECK(cudaMemsetAsync(d_sum_self, 0, sizeof(unsigned long long), sFR));
-            CUDA_CHECK(cudaMemsetAsync(d_sum_cross, 0, sizeof(unsigned long long), sFR));
-            CUDA_CHECK(cudaMemsetAsync(d_count_cross, 0, sizeof(unsigned int), sFR));
-
-            k_sum_luma565<<<blocks1_scaled, threads1, 0, sFR>>>(d_heat_self, OW * OH, d_sum_self);
-            k_sum_luma565<<<blocks1_scaled, threads1, 0, sFR>>>(d_heat_cross, OW * OH, d_sum_cross);
-            k_count_nonzero_diff<<<blocks1_scaled, threads1, 0, sFR>>>(d_heat_cross, OW * OH, 8, d_count_cross);
-
-            k_compose_2x3<<<grid2(WIN_W, WIN_H, block2), block2, 0, sFR>>>(
-                d_fr_up, d_lg_up,
-                d_fr_ctl, d_lg_ctl,
-                d_heat_self, d_heat_cross,
-                OW, OH,
-                d_composite
-            );
-
-            CUDA_CHECK(cudaMemcpyAsync(
-                h_composite.data(), d_composite,
-                (size_t)WIN_W * WIN_H * sizeof(uint16_t),
-                cudaMemcpyDeviceToHost, sFR
-            ));
-
-            CUDA_CHECK(cudaEventRecord(evAll, sFR));
-            CUDA_CHECK(cudaEventSynchronize(evAll));
-
-            float fr_up_ms = 0.f, lg_up_ms = 0.f, self_diff_ms = 0.f, cross_diff_ms = 0.f;
-            CUDA_CHECK(cudaEventElapsedTime(&fr_up_ms, evFRUp0, evFRUp1));
-            CUDA_CHECK(cudaEventElapsedTime(&lg_up_ms, evLGUp0, evLGUp1));
-            CUDA_CHECK(cudaEventElapsedTime(&self_diff_ms, evSelf0, evSelf1));
-            CUDA_CHECK(cudaEventElapsedTime(&cross_diff_ms, evCross0, evCross1));
-
-            unsigned long long h_sum_self = 0, h_sum_cross = 0;
-            unsigned int h_count_cross = 0;
-            CUDA_CHECK(cudaMemcpy(&h_sum_self, d_sum_self, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(&h_sum_cross, d_sum_cross, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(&h_count_cross, d_count_cross, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-
-            double heat_self_mean = (double)h_sum_self / (double)(OW * OH);
-            double heat_cross_mean = (double)h_sum_cross / (double)(OW * OH);
-            double total_gpu_ms = std::max(std::max((double)fr_up_ms, (double)lg_up_ms),
-                                           std::max((double)self_diff_ms, (double)cross_diff_ms));
-            int blocks_used = args.blocks > 0 ? args.blocks : blocks1_native;
-
-            csv << frame_idx << ","
-                << threads1 << ","
-                << blocks_used << ","
-                << fr_up_ms << ","
-                << lg_up_ms << ","
-                << self_diff_ms << ","
-                << cross_diff_ms << ","
-                << total_gpu_ms << ","
-                << heat_self_mean << ","
-                << heat_cross_mean << ","
-                << h_count_cross << "\n";
+            FrameMetrics metrics = collect_frame_metrics(gpu, geom);
+            write_csv_row(csv, frame_idx, threads_used, blocks_used, metrics);
 
             if (args.print_every > 0 && (frame_idx % args.print_every) == 0) {
-                std::cout << "[frame " << frame_idx << "] "
-                          << "threads=" << threads1
-                          << " blocks=" << blocks_used
-                          << " fr_up_ms=" << fr_up_ms
-                          << " lg_up_ms=" << lg_up_ms
-                          << " self_diff_ms=" << self_diff_ms
-                          << " cross_diff_ms=" << cross_diff_ms
-                          << " total_gpu_ms=" << total_gpu_ms
-                          << " heat_self_mean=" << heat_self_mean
-                          << " heat_cross_mean=" << heat_cross_mean
-                          << " nonzero_diff_pixels=" << h_count_cross
-                          << "\n";
+                print_metrics(frame_idx, threads_used, blocks_used, metrics);
             }
 
-            void* pixels = nullptr;
-            int pitchBytes = 0;
-            if (SDL_LockTexture(tex, nullptr, &pixels, &pitchBytes) == 0) {
-                for (int y = 0; y < WIN_H; y++) {
-                    std::memcpy(
-                        (uint8_t*)pixels + (size_t)y * (size_t)pitchBytes,
-                        &h_composite[(size_t)y * (size_t)WIN_W],
-                        (size_t)WIN_W * sizeof(uint16_t)
-                    );
-                }
-                SDL_UnlockTexture(tex);
-            }
-
-            SDL_RenderClear(ren);
-            SDL_RenderCopy(ren, tex, nullptr, nullptr);
-            SDL_RenderPresent(ren);
+            render_composite_texture(sdl.texture, sdl.renderer, host_composite_rgb565, geom);
 
             frame_idx++;
-            if (args.frames >= 0 && frame_idx >= args.frames) running = false;
+            if (args.frames >= 0 && frame_idx >= args.frames) {
+                running = false;
+            }
 
             next_tick += (uint64_t)(frame_ms + 0.5);
             uint64_t now = SDL_GetTicks64();
-            if (next_tick > now) SDL_Delay((Uint32)(next_tick - now));
-            else next_tick = now;
+            if (next_tick > now) {
+                SDL_Delay((Uint32)(next_tick - now));
+            } else {
+                next_tick = now;
+            }
         }
 
         csv.close();
-
-        if (g_audio_dev) SDL_CloseAudioDevice(g_audio_dev);
-
-        SDL_DestroyTexture(tex);
-        SDL_DestroyRenderer(ren);
-        SDL_DestroyWindow(win);
+        destroy_cuda_resources(gpu);
+        destroy_sdl_resources(sdl);
+        shutdown_audio();
         SDL_Quit();
 
-        CUDA_CHECK(cudaEventDestroy(evFRUp0));
-        CUDA_CHECK(cudaEventDestroy(evFRUp1));
-        CUDA_CHECK(cudaEventDestroy(evLGUp0));
-        CUDA_CHECK(cudaEventDestroy(evLGUp1));
-        CUDA_CHECK(cudaEventDestroy(evSelf0));
-        CUDA_CHECK(cudaEventDestroy(evSelf1));
-        CUDA_CHECK(cudaEventDestroy(evCross0));
-        CUDA_CHECK(cudaEventDestroy(evCross1));
-        CUDA_CHECK(cudaEventDestroy(evAll));
-        CUDA_CHECK(cudaStreamDestroy(sFR));
-        CUDA_CHECK(cudaStreamDestroy(sLG));
-
-        CUDA_CHECK(cudaFree(d_fr_raw));
-        CUDA_CHECK(cudaFree(d_lg_raw));
-        CUDA_CHECK(cudaFree(d_fr_up));
-        CUDA_CHECK(cudaFree(d_lg_up));
-        CUDA_CHECK(cudaFree(d_fr_ctl));
-        CUDA_CHECK(cudaFree(d_lg_ctl));
-        CUDA_CHECK(cudaFree(d_heat_cross_native));
-        CUDA_CHECK(cudaFree(d_heat_self));
-        CUDA_CHECK(cudaFree(d_heat_cross));
-        CUDA_CHECK(cudaFree(d_composite));
-        CUDA_CHECK(cudaFree(d_sum_self));
-        CUDA_CHECK(cudaFree(d_sum_cross));
-        CUDA_CHECK(cudaFree(d_count_cross));
-
-        destroy_instance(B);
-        destroy_instance(A);
+        destroy_instance(leaf_green);
+        destroy_instance(fire_red);
 
         return 0;
 
