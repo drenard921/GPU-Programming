@@ -127,6 +127,10 @@
   } \
 } while(0)
 
+#define CUDA_KERNEL_CHECK() do { \
+  CUDA_CHECK(cudaGetLastError()); \
+} while(0)
+
 static constexpr int GBA_WIDTH = 240;
 static constexpr int GBA_HEIGHT = 160;
 static constexpr int DEFAULT_SCALE = 3;
@@ -788,7 +792,7 @@ __global__ void k_compose_2x3(const uint16_t* p00, const uint16_t* p10,
     if (row == 1 && col == 1) src = p11;
     if (row == 2 && col == 0) src = p02;
     if (row == 2 && col == 1) src = p12;
-
+    if (!src) return;                      
     out[y * W + x] = src[ly * ow + lx];
 }
 
@@ -813,6 +817,8 @@ struct FrameMetrics {
     double heat_self_mean = 0.0;
     double heat_cross_mean = 0.0;
     unsigned int nonzero_diff_pixels = 0;
+    bool native_covered = true;
+    bool scaled_covered = true;
 };
 
 struct SdlResources {
@@ -834,6 +840,8 @@ struct CudaResources {
 
     cudaStream_t fr_stream = nullptr;
     cudaStream_t lg_stream = nullptr;
+    cudaEvent_t ev_fr_copy_done = nullptr;
+    cudaEvent_t ev_lg_copy_done = nullptr;
 
     cudaEvent_t ev_fr_up_start = nullptr, ev_fr_up_end = nullptr;
     cudaEvent_t ev_lg_up_start = nullptr, ev_lg_up_end = nullptr;
@@ -853,7 +861,8 @@ static Geometry make_geometry(int scale) {
 }
 
 static void write_csv_header(std::ofstream& csv) {
-    csv << "frame,threads,blocks,fr_up_ms,lg_up_ms,self_diff_ms,cross_diff_ms,"
+    csv << "frame,threads,blocks,native_covered,scaled_covered,"
+           "fr_up_ms,lg_up_ms,self_diff_ms,cross_diff_ms,"
            "total_gpu_ms,heat_self_mean,heat_cross_mean,nonzero_diff_pixels\n";
 }
 
@@ -865,6 +874,8 @@ static void write_csv_row(std::ofstream& csv,
     csv << frame_idx << ","
         << threads << ","
         << blocks << ","
+        << metrics.native_covered << ","
+        << metrics.scaled_covered << ","
         << metrics.fr_up_ms << ","
         << metrics.lg_up_ms << ","
         << metrics.self_diff_ms << ","
@@ -882,6 +893,8 @@ static void print_metrics(int frame_idx,
     std::cout << "[frame " << frame_idx << "] "
               << "threads=" << threads
               << " blocks=" << blocks
+              << " native_covered=" << metrics.native_covered
+              << " scaled_covered=" << metrics.scaled_covered
               << " fr_up_ms=" << metrics.fr_up_ms
               << " lg_up_ms=" << metrics.lg_up_ms
               << " self_diff_ms=" << metrics.self_diff_ms
@@ -1012,6 +1025,9 @@ static void allocate_cuda_resources(CudaResources& gpu, const Geometry& geom) {
     CUDA_CHECK(cudaStreamCreate(&gpu.fr_stream));
     CUDA_CHECK(cudaStreamCreate(&gpu.lg_stream));
 
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_fr_copy_done));
+    CUDA_CHECK(cudaEventCreate(&gpu.ev_lg_copy_done));
+
     CUDA_CHECK(cudaEventCreate(&gpu.ev_fr_up_start));
     CUDA_CHECK(cudaEventCreate(&gpu.ev_fr_up_end));
     CUDA_CHECK(cudaEventCreate(&gpu.ev_lg_up_start));
@@ -1024,32 +1040,34 @@ static void allocate_cuda_resources(CudaResources& gpu, const Geometry& geom) {
 }
 
 static void destroy_cuda_resources(CudaResources& gpu) {
-    if (gpu.ev_fr_up_start) CUDA_CHECK(cudaEventDestroy(gpu.ev_fr_up_start));
-    if (gpu.ev_fr_up_end)   CUDA_CHECK(cudaEventDestroy(gpu.ev_fr_up_end));
-    if (gpu.ev_lg_up_start) CUDA_CHECK(cudaEventDestroy(gpu.ev_lg_up_start));
-    if (gpu.ev_lg_up_end)   CUDA_CHECK(cudaEventDestroy(gpu.ev_lg_up_end));
-    if (gpu.ev_self_start)  CUDA_CHECK(cudaEventDestroy(gpu.ev_self_start));
-    if (gpu.ev_self_end)    CUDA_CHECK(cudaEventDestroy(gpu.ev_self_end));
-    if (gpu.ev_cross_start) CUDA_CHECK(cudaEventDestroy(gpu.ev_cross_start));
-    if (gpu.ev_cross_end)   CUDA_CHECK(cudaEventDestroy(gpu.ev_cross_end));
-    if (gpu.ev_frame_done)  CUDA_CHECK(cudaEventDestroy(gpu.ev_frame_done));
+    if (gpu.ev_fr_copy_done) CUDA_CHECK(cudaEventDestroy(gpu.ev_fr_copy_done));
+    if (gpu.ev_lg_copy_done) CUDA_CHECK(cudaEventDestroy(gpu.ev_lg_copy_done));
+    if (gpu.ev_fr_up_start)  CUDA_CHECK(cudaEventDestroy(gpu.ev_fr_up_start));
+    if (gpu.ev_fr_up_end)    CUDA_CHECK(cudaEventDestroy(gpu.ev_fr_up_end));
+    if (gpu.ev_lg_up_start)  CUDA_CHECK(cudaEventDestroy(gpu.ev_lg_up_start));
+    if (gpu.ev_lg_up_end)    CUDA_CHECK(cudaEventDestroy(gpu.ev_lg_up_end));
+    if (gpu.ev_self_start)   CUDA_CHECK(cudaEventDestroy(gpu.ev_self_start));
+    if (gpu.ev_self_end)     CUDA_CHECK(cudaEventDestroy(gpu.ev_self_end));
+    if (gpu.ev_cross_start)  CUDA_CHECK(cudaEventDestroy(gpu.ev_cross_start));
+    if (gpu.ev_cross_end)    CUDA_CHECK(cudaEventDestroy(gpu.ev_cross_end));
+    if (gpu.ev_frame_done)   CUDA_CHECK(cudaEventDestroy(gpu.ev_frame_done));
 
     if (gpu.fr_stream) CUDA_CHECK(cudaStreamDestroy(gpu.fr_stream));
     if (gpu.lg_stream) CUDA_CHECK(cudaStreamDestroy(gpu.lg_stream));
 
-    if (gpu.fr_raw) CUDA_CHECK(cudaFree(gpu.fr_raw));
-    if (gpu.lg_raw) CUDA_CHECK(cudaFree(gpu.lg_raw));
-    if (gpu.fr_up) CUDA_CHECK(cudaFree(gpu.fr_up));
-    if (gpu.lg_up) CUDA_CHECK(cudaFree(gpu.lg_up));
-    if (gpu.fr_nearest) CUDA_CHECK(cudaFree(gpu.fr_nearest));
-    if (gpu.lg_nearest) CUDA_CHECK(cudaFree(gpu.lg_nearest));
+    if (gpu.fr_raw)            CUDA_CHECK(cudaFree(gpu.fr_raw));
+    if (gpu.lg_raw)            CUDA_CHECK(cudaFree(gpu.lg_raw));
+    if (gpu.fr_up)             CUDA_CHECK(cudaFree(gpu.fr_up));
+    if (gpu.lg_up)             CUDA_CHECK(cudaFree(gpu.lg_up));
+    if (gpu.fr_nearest)        CUDA_CHECK(cudaFree(gpu.fr_nearest));
+    if (gpu.lg_nearest)        CUDA_CHECK(cudaFree(gpu.lg_nearest));
     if (gpu.heat_cross_native) CUDA_CHECK(cudaFree(gpu.heat_cross_native));
-    if (gpu.heat_self) CUDA_CHECK(cudaFree(gpu.heat_self));
-    if (gpu.heat_cross) CUDA_CHECK(cudaFree(gpu.heat_cross));
-    if (gpu.composite) CUDA_CHECK(cudaFree(gpu.composite));
+    if (gpu.heat_self)         CUDA_CHECK(cudaFree(gpu.heat_self));
+    if (gpu.heat_cross)        CUDA_CHECK(cudaFree(gpu.heat_cross));
+    if (gpu.composite)         CUDA_CHECK(cudaFree(gpu.composite));
 
-    if (gpu.sum_self) CUDA_CHECK(cudaFree(gpu.sum_self));
-    if (gpu.sum_cross) CUDA_CHECK(cudaFree(gpu.sum_cross));
+    if (gpu.sum_self)   CUDA_CHECK(cudaFree(gpu.sum_self));
+    if (gpu.sum_cross)  CUDA_CHECK(cudaFree(gpu.sum_cross));
     if (gpu.count_cross) CUDA_CHECK(cudaFree(gpu.count_cross));
 
     gpu = CudaResources{};
@@ -1205,6 +1223,21 @@ static void process_gpu_frame(const Instance& fire_red,
     const int threads1 = args.threads;
     const int blocks1_native = args.blocks > 0 ? args.blocks : (geom.raw_w * geom.raw_h + threads1 - 1) / threads1;
     const int blocks1_scaled = args.blocks > 0 ? args.blocks : (geom.up_w * geom.up_h + threads1 - 1) / threads1;
+    const int native_work = geom.raw_w * geom.raw_h;
+    const int scaled_work = geom.up_w * geom.up_h;
+
+    const bool native_covered = (blocks1_native * threads1) >= native_work;
+    const bool scaled_covered = (blocks1_scaled * threads1) >= scaled_work;
+
+    if (!native_covered || !scaled_covered) {
+    std::cerr << "WARN: underprovisioned launch configuration: "
+              << "threads=" << threads1
+              << " blocks_native=" << blocks1_native
+              << " blocks_scaled=" << blocks1_scaled
+              << " native_covered=" << native_covered
+              << " scaled_covered=" << scaled_covered
+              << "\n";
+    }
 
     // Copy raw emulator frames to GPU.
     CUDA_CHECK(cudaMemcpyAsync(
@@ -1212,17 +1245,21 @@ static void process_gpu_frame(const Instance& fire_red,
         (size_t)geom.raw_w * (size_t)geom.raw_h * sizeof(uint16_t),
         cudaMemcpyHostToDevice, gpu.fr_stream
     ));
+    CUDA_CHECK(cudaEventRecord(gpu.ev_fr_copy_done, gpu.fr_stream));
+
     CUDA_CHECK(cudaMemcpyAsync(
         gpu.lg_raw, leaf_green.frame565.data(),
         (size_t)geom.raw_w * (size_t)geom.raw_h * sizeof(uint16_t),
         cudaMemcpyHostToDevice, gpu.lg_stream
     ));
+    CUDA_CHECK(cudaEventRecord(gpu.ev_lg_copy_done, gpu.lg_stream));
 
     // Timed region 1: FireRed bilinear upscale on its own CUDA stream.
     CUDA_CHECK(cudaEventRecord(gpu.ev_fr_up_start, gpu.fr_stream));
     k_upscale_bilinear_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.fr_stream>>>(
         gpu.fr_raw, geom.raw_w, geom.raw_h, gpu.fr_up, geom.up_w, geom.up_h
     );
+    CUDA_KERNEL_CHECK();
     CUDA_CHECK(cudaEventRecord(gpu.ev_fr_up_end, gpu.fr_stream));
 
     // Timed region 2: LeafGreen bilinear upscale on its own CUDA stream.
@@ -1230,32 +1267,43 @@ static void process_gpu_frame(const Instance& fire_red,
     k_upscale_bilinear_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.lg_stream>>>(
         gpu.lg_raw, geom.raw_w, geom.raw_h, gpu.lg_up, geom.up_w, geom.up_h
     );
+    CUDA_KERNEL_CHECK();
     CUDA_CHECK(cudaEventRecord(gpu.ev_lg_up_end, gpu.lg_stream));
 
     // Control row: nearest-neighbor upscales for comparison.
     k_upscale_nearest_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.fr_stream>>>(
         gpu.fr_raw, geom.raw_w, geom.raw_h, gpu.fr_nearest, geom.up_w, geom.up_h
     );
+    CUDA_KERNEL_CHECK();
+
     k_upscale_nearest_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.lg_stream>>>(
         gpu.lg_raw, geom.raw_w, geom.raw_h, gpu.lg_nearest, geom.up_w, geom.up_h
     );
+    CUDA_KERNEL_CHECK();
 
     // Timed region 3: FireRed bilinear vs nearest heatmap in display space.
     CUDA_CHECK(cudaEventRecord(gpu.ev_self_start, gpu.fr_stream));
     k_heatmap_diff_native<<<blocks1_scaled, threads1, 0, gpu.fr_stream>>>(
         gpu.fr_up, gpu.fr_nearest, geom.up_w * geom.up_h, gpu.heat_self
     );
+    CUDA_KERNEL_CHECK();
     CUDA_CHECK(cudaEventRecord(gpu.ev_self_end, gpu.fr_stream));
 
     // Timed region 4: FireRed vs LeafGreen source difference heatmap.
-    CUDA_CHECK(cudaStreamWaitEvent(gpu.fr_stream, gpu.ev_lg_up_end, 0));
+    // Wait only for the LeafGreen raw-frame copy to complete before reading gpu.lg_raw.
+    CUDA_CHECK(cudaStreamWaitEvent(gpu.fr_stream, gpu.ev_lg_copy_done, 0));
     CUDA_CHECK(cudaEventRecord(gpu.ev_cross_start, gpu.fr_stream));
+
     k_heatmap_diff_native<<<blocks1_native, threads1, 0, gpu.fr_stream>>>(
         gpu.fr_raw, gpu.lg_raw, geom.raw_w * geom.raw_h, gpu.heat_cross_native
     );
+    CUDA_KERNEL_CHECK();
+
     k_upscale_nearest_565<<<grid2(geom.up_w, geom.up_h, block2), block2, 0, gpu.fr_stream>>>(
         gpu.heat_cross_native, geom.raw_w, geom.raw_h, gpu.heat_cross, geom.up_w, geom.up_h
     );
+    CUDA_KERNEL_CHECK();
+
     CUDA_CHECK(cudaEventRecord(gpu.ev_cross_end, gpu.fr_stream));
 
     // Metric reductions.
@@ -1266,12 +1314,17 @@ static void process_gpu_frame(const Instance& fire_red,
     k_sum_luma565<<<blocks1_scaled, threads1, 0, gpu.fr_stream>>>(
         gpu.heat_self, geom.up_w * geom.up_h, gpu.sum_self
     );
+    CUDA_KERNEL_CHECK();
+
     k_sum_luma565<<<blocks1_scaled, threads1, 0, gpu.fr_stream>>>(
         gpu.heat_cross, geom.up_w * geom.up_h, gpu.sum_cross
     );
+    CUDA_KERNEL_CHECK();
+
     k_count_nonzero_diff<<<blocks1_scaled, threads1, 0, gpu.fr_stream>>>(
         gpu.heat_cross, geom.up_w * geom.up_h, DIFF_THRESHOLD, gpu.count_cross
     );
+    CUDA_KERNEL_CHECK();
 
     // Compose the six panels into one RGB565 output image.
     k_compose_2x3<<<grid2(geom.win_w, geom.win_h, block2), block2, 0, gpu.fr_stream>>>(
@@ -1281,6 +1334,7 @@ static void process_gpu_frame(const Instance& fire_red,
         geom.up_w, geom.up_h,
         gpu.composite
     );
+    CUDA_KERNEL_CHECK();
 
     CUDA_CHECK(cudaMemcpyAsync(
         host_composite_rgb565.data(), gpu.composite,
@@ -1306,10 +1360,6 @@ int main(int argc, char** argv) {
         fire_red.api.retro_get_system_av_info(&av);
         tls_current = nullptr;
 
-        const double target_fps = (av.timing.fps > 1.0) ? av.timing.fps : 59.7275;
-        const double frame_ms = 1000.0 / target_fps;
-        uint64_t next_tick = SDL_GetTicks64();
-
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
             throw std::runtime_error(std::string("SDL_Init failed: ") + SDL_GetError());
         }
@@ -1317,6 +1367,10 @@ int main(int argc, char** argv) {
         init_audio(av);
 
         Geometry geom = make_geometry(args.scale);
+
+        const double target_fps = (av.timing.fps > 1.0) ? av.timing.fps : 59.7275;
+        const double frame_ms = 1000.0 / target_fps;
+        uint64_t next_tick = SDL_GetTicks64();
 
         SdlResources sdl{};
         init_sdl_resources(geom, sdl);
@@ -1361,9 +1415,25 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            const int native_work = geom.raw_w * geom.raw_h;
+            const int scaled_work = geom.up_w * geom.up_h;
+
+            const int native_blocks_for_metrics =
+                args.blocks > 0 ? args.blocks : (native_work + args.threads - 1) / args.threads;
+            const int scaled_blocks_for_metrics =
+                args.blocks > 0 ? args.blocks : (scaled_work + args.threads - 1) / args.threads;
+
+            const bool native_covered =
+                (native_blocks_for_metrics * args.threads) >= native_work;
+            const bool scaled_covered =
+                (scaled_blocks_for_metrics * args.threads) >= scaled_work;
+
             process_gpu_frame(fire_red, leaf_green, geom, args, gpu, host_composite_rgb565);
 
             FrameMetrics metrics = collect_frame_metrics(gpu, geom);
+            metrics.native_covered = native_covered;
+            metrics.scaled_covered = scaled_covered;
+
             write_csv_row(csv, frame_idx, threads_used, blocks_used, metrics);
 
             if (args.print_every > 0 && (frame_idx % args.print_every) == 0) {
@@ -1387,13 +1457,15 @@ int main(int argc, char** argv) {
         }
 
         csv.close();
+        CUDA_CHECK(cudaDeviceSynchronize());
         destroy_cuda_resources(gpu);
-        destroy_sdl_resources(sdl);
-        shutdown_audio();
-        SDL_Quit();
 
         destroy_instance(leaf_green);
         destroy_instance(fire_red);
+
+        destroy_sdl_resources(sdl);
+        shutdown_audio();
+        SDL_Quit();
 
         return 0;
 

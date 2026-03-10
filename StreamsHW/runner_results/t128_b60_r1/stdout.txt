@@ -1,0 +1,5 @@
+[frame 0] threads=128 blocks=60 native_covered=0 scaled_covered=0 fr_up_ms=2.04877 lg_up_ms=0.052704 self_diff_ms=0.102592 cross_diff_ms=0.017376 total_gpu_ms=2.04877 heat_self_mean=0.4 heat_cross_mean=0.4 nonzero_diff_pixels=7680
+[frame 500] threads=128 blocks=60 native_covered=0 scaled_covered=0 fr_up_ms=0.491936 lg_up_ms=0.5488 self_diff_ms=0.014336 cross_diff_ms=0.027648 total_gpu_ms=0.5488 heat_self_mean=0.4 heat_cross_mean=0.4 nonzero_diff_pixels=7680
+[frame 1000] threads=128 blocks=60 native_covered=0 scaled_covered=0 fr_up_ms=0.596288 lg_up_ms=0.72432 self_diff_ms=0.031744 cross_diff_ms=0.06144 total_gpu_ms=0.72432 heat_self_mean=0.4 heat_cross_mean=0.4 nonzero_diff_pixels=7680
+[frame 1500] threads=128 blocks=60 native_covered=0 scaled_covered=0 fr_up_ms=1.36426 lg_up_ms=1.51181 self_diff_ms=0.022528 cross_diff_ms=0.0512 total_gpu_ms=1.51181 heat_self_mean=0.4 heat_cross_mean=0.4 nonzero_diff_pixels=7680
+[frame 2000] threads=128 blocks=60 native_covered=0 scaled_covered=0 fr_up_ms=0.59168 lg_up_ms=0.718944 self_diff_ms=0.029696 cross_diff_ms=0.057344 total_gpu_ms=0.718944 heat_self_mean=0.406499 heat_cross_mean=1.19875 nonzero_diff_pixels=7680
