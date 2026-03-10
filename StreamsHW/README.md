@@ -341,7 +341,7 @@ The GPU visualizations also served as debugging tools during kernel development.
 
 ## Pixel Difference Heatmap
 
-![Pixel difference]('plots/Example of pixel difference .png')
+![Pixel difference](plots/Full_diff.png)
 
 Even when images appear visually identical, the heatmap reveals small interpolation differences.
 
@@ -349,7 +349,7 @@ Even when images appear visually identical, the heatmap reveals small interpolat
 
 ## Bilinear Interpolation Differences
 
-![Bilinear difference]('plots/Example of minor difference on bilinear transform.png')
+![Bilinear difference](plots/Bilinear_diff.png)
 
 Bilinear interpolation introduces subtle color differences relative to nearest neighbor scaling.
 
@@ -357,7 +357,7 @@ Bilinear interpolation introduces subtle color differences relative to nearest n
 
 ## Partial GPU Coverage
 
-![Partial coverage]('plots/Example of partial coverage.png')
+![Partial coverage](plots/Inoccupancy.png)
 
 When the CUDA grid does not launch enough threads to cover the image domain, only part of the frame is processed.
 
@@ -371,7 +371,7 @@ Because the two emulator instances run independently, RNG events may diverge.
 
 This produces slightly different gameplay outcomes.
 
-![RNG divergence]('plots/RNG Divergence.png')
+![RNG divergence](plots/RNGDivergence.png)
 
 Even with identical inputs, independent RNG state can cause the games to evolve differently.
 
