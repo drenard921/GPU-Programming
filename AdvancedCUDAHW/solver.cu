@@ -13,9 +13,6 @@
 //   - cuSOLVER: solve a dense linear system for portfolio weights
 //   - cuBLAS: vector summaries and contribution-vector setup
 //
-// Build example:
-//   nvcc -O2 -std=c++17 solver.cu -o solver_app -lcublas -lcusolver
-//
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -23,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -33,15 +31,18 @@
 
 struct Stock {
     std::string ticker;
-    float price = 0.0f;
-    float growth_rate = 0.0f;     // annual decimal, e.g. 0.08
-    float dividend_yield = 0.0f;  // annual decimal, e.g. 0.03
+    float price_now = 0.0f;
+    float cagr_3y = 0.0f;
+    float cagr_5y = 0.0f;
+    float dividend_yield = 0.0f;
+    float current_holding = 0.0f;
 };
 
 struct InputData {
     float monthly_investment = 500.0f;
     int years = 10;
     std::string goal = "balanced";
+    std::string growth_basis = "3y";
     std::vector<Stock> stocks;
 };
 
@@ -80,11 +81,13 @@ struct InputData {
 
 static std::string trim(const std::string& s) {
     size_t start = 0;
-    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) {
+    while (start < s.size() &&
+           std::isspace(static_cast<unsigned char>(s[start]))) {
         ++start;
     }
     size_t end = s.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) {
+    while (end > start &&
+           std::isspace(static_cast<unsigned char>(s[end - 1]))) {
         --end;
     }
     return s.substr(start, end - start);
@@ -98,6 +101,13 @@ static std::vector<std::string> split_csv_line(const std::string& line) {
         out.push_back(trim(item));
     }
     return out;
+}
+
+static float active_growth_rate(const Stock& stock, const std::string& basis) {
+    if (basis == "5y") {
+        return stock.cagr_5y;
+    }
+    return stock.cagr_3y;
 }
 
 static InputData read_input_csv(const std::string& path) {
@@ -128,22 +138,29 @@ static InputData read_input_csv(const std::string& path) {
                 data.years = std::stoi(cols[1]);
             } else if (cols.size() >= 2 && cols[0] == "goal") {
                 data.goal = cols[1];
-            } else if (cols.size() >= 4 &&
+            } else if (cols.size() >= 2 && cols[0] == "growth_basis") {
+                data.growth_basis = cols[1];
+            } else if (cols.size() >= 6 &&
                        cols[0] == "ticker" &&
-                       cols[1] == "price" &&
-                       cols[2] == "growth_rate" &&
-                       cols[3] == "dividend_yield") {
+                       cols[1] == "price_now" &&
+                       cols[2] == "cagr_3y" &&
+                       cols[3] == "cagr_5y" &&
+                       cols[4] == "dividend_yield" &&
+                       cols[5] == "current_holding") {
                 in_stock_table = true;
             }
         } else {
-            if (cols.size() < 4) {
+            if (cols.size() < 6) {
                 continue;
             }
+
             Stock s;
             s.ticker = cols[0];
-            s.price = std::stof(cols[1]);
-            s.growth_rate = std::stof(cols[2]);
-            s.dividend_yield = std::stof(cols[3]);
+            s.price_now = std::stof(cols[1]);
+            s.cagr_3y = std::stof(cols[2]);
+            s.cagr_5y = std::stof(cols[3]);
+            s.dividend_yield = std::stof(cols[4]);
+            s.current_holding = std::stof(cols[5]);
             data.stocks.push_back(s);
         }
     }
@@ -157,18 +174,22 @@ static InputData read_input_csv(const std::string& path) {
     if (data.monthly_investment <= 0.0f) {
         throw std::runtime_error("Monthly investment must be positive");
     }
+    if (data.growth_basis != "3y" && data.growth_basis != "5y") {
+        throw std::runtime_error("growth_basis must be '3y' or '5y'");
+    }
 
     return data;
 }
 
 static std::vector<float> build_score_vector(
     const std::vector<Stock>& stocks,
-    const std::string& goal
+    const std::string& goal,
+    const std::string& growth_basis
 ) {
     std::vector<float> scores(stocks.size(), 0.0f);
 
     for (size_t i = 0; i < stocks.size(); ++i) {
-        const float g = stocks[i].growth_rate;
+        const float g = active_growth_rate(stocks[i], growth_basis);
         const float d = stocks[i].dividend_yield;
 
         if (goal == "growth") {
@@ -194,9 +215,6 @@ static std::vector<float> build_score_vector(
     return scores;
 }
 
-// Solve A w = b with cuSOLVER, where A is a dense NxN matrix in column-major order.
-// We construct A = I + alpha * 11^T, which is invertible for alpha > 0.
-// This keeps the solve stable while still making cuSOLVER do real work.
 static std::vector<float> solve_weights_with_cusolver(
     const std::vector<float>& scores
 ) {
@@ -212,7 +230,7 @@ static std::vector<float> solve_weights_with_cusolver(
             if (row == col) {
                 val += 1.0f;
             }
-            h_A[col * n + row] = val;  // column-major
+            h_A[col * n + row] = val;
         }
     }
 
@@ -230,10 +248,12 @@ static std::vector<float> solve_weights_with_cusolver(
     CUDA_CHECK(cudaMalloc(&d_ipiv, sizeof(int) * n));
     CUDA_CHECK(cudaMalloc(&d_info, sizeof(int)));
 
-    CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), sizeof(float) * n * n,
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b, h_b.data(), sizeof(float) * n,
-                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        d_A, h_A.data(), sizeof(float) * n * n, cudaMemcpyHostToDevice
+    ));
+    CUDA_CHECK(cudaMemcpy(
+        d_b, h_b.data(), sizeof(float) * n, cudaMemcpyHostToDevice
+    ));
 
     int lwork = 0;
     CUSOLVER_CHECK(cusolverDnSgetrf_bufferSize(solver, n, n, d_A, n, &lwork));
@@ -246,8 +266,9 @@ static std::vector<float> solve_weights_with_cusolver(
     int info_h = 0;
     CUDA_CHECK(cudaMemcpy(&info_h, d_info, sizeof(int), cudaMemcpyDeviceToHost));
     if (info_h != 0) {
-        throw std::runtime_error("LU factorization failed, info=" +
-                                 std::to_string(info_h));
+        throw std::runtime_error(
+            "LU factorization failed, info=" + std::to_string(info_h)
+        );
     }
 
     CUSOLVER_CHECK(cusolverDnSgetrs(
@@ -256,13 +277,15 @@ static std::vector<float> solve_weights_with_cusolver(
 
     CUDA_CHECK(cudaMemcpy(&info_h, d_info, sizeof(int), cudaMemcpyDeviceToHost));
     if (info_h != 0) {
-        throw std::runtime_error("Linear solve failed, info=" +
-                                 std::to_string(info_h));
+        throw std::runtime_error(
+            "Linear solve failed, info=" + std::to_string(info_h)
+        );
     }
 
     std::vector<float> weights(n, 0.0f);
-    CUDA_CHECK(cudaMemcpy(weights.data(), d_b, sizeof(float) * n,
-                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        weights.data(), d_b, sizeof(float) * n, cudaMemcpyDeviceToHost
+    ));
 
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_b));
@@ -319,12 +342,13 @@ static void write_results_csv(
         throw std::runtime_error("Failed to open output file: " + path);
     }
 
-    out << "month,total_value,total_dividend_income\n";
+    out << "month,total_value,total_dividend_income,monthly_dividend_income\n";
     for (size_t i = 0; i < totals.size(); ++i) {
         out << i << ","
             << std::fixed << std::setprecision(2)
             << totals[i] << ","
-            << dividends[i] << "\n";
+            << dividends[i] << ","
+            << (dividends[i] / 12.0f) << "\n";
     }
 }
 
@@ -343,16 +367,34 @@ int main(int argc, char** argv) {
         const int n = static_cast<int>(input.stocks.size());
         const int months = input.years * 12;
 
-        std::vector<float> scores = build_score_vector(input.stocks, input.goal);
+        std::vector<float> scores = build_score_vector(
+            input.stocks, input.goal, input.growth_basis
+        );
         std::vector<float> weights = solve_weights_with_cusolver(scores);
 
+        std::vector<float> h_initial_values(n, 0.0f);
         std::vector<float> h_monthly_return(n, 0.0f);
         std::vector<float> h_annual_dividend(n, 0.0f);
         std::vector<float> h_ones(n, 1.0f);
+        std::vector<float> h_current_weights(n, 0.0f);
+
+        float current_total = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            h_initial_values[i] = input.stocks[i].current_holding;
+            current_total += h_initial_values[i];
+        }
+
+        if (current_total > 0.0f) {
+            for (int i = 0; i < n; ++i) {
+                h_current_weights[i] = h_initial_values[i] / current_total;
+            }
+        }
 
         for (int i = 0; i < n; ++i) {
-            const float annual_growth = input.stocks[i].growth_rate;
+            const float annual_growth =
+                active_growth_rate(input.stocks[i], input.growth_basis);
             const float annual_div = input.stocks[i].dividend_yield;
+
             h_monthly_return[i] = (annual_growth + annual_div) / 12.0f;
             h_annual_dividend[i] = annual_div;
         }
@@ -374,23 +416,43 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMalloc(&d_ones, sizeof(float) * n));
         CUDA_CHECK(cudaMalloc(&d_annual_dividend, sizeof(float) * n));
 
-        CUDA_CHECK(cudaMemset(d_values, 0, sizeof(float) * n));
-        CUDA_CHECK(cudaMemcpy(d_monthly_return, h_monthly_return.data(),
-                              sizeof(float) * n, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_weights, weights.data(),
-                              sizeof(float) * n, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_ones, h_ones.data(),
-                              sizeof(float) * n, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_annual_dividend, h_annual_dividend.data(),
-                              sizeof(float) * n, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            d_values, h_initial_values.data(), sizeof(float) * n,
+            cudaMemcpyHostToDevice
+        ));
+        CUDA_CHECK(cudaMemcpy(
+            d_monthly_return, h_monthly_return.data(), sizeof(float) * n,
+            cudaMemcpyHostToDevice
+        ));
+        CUDA_CHECK(cudaMemcpy(
+            d_weights, weights.data(), sizeof(float) * n,
+            cudaMemcpyHostToDevice
+        ));
+        CUDA_CHECK(cudaMemcpy(
+            d_ones, h_ones.data(), sizeof(float) * n,
+            cudaMemcpyHostToDevice
+        ));
+        CUDA_CHECK(cudaMemcpy(
+            d_annual_dividend, h_annual_dividend.data(), sizeof(float) * n,
+            cudaMemcpyHostToDevice
+        ));
 
-        // contribution vector = monthly_investment * weights
         CUBLAS_CHECK(cublasScopy(blas, n, d_weights, 1, d_contrib, 1));
-        CUBLAS_CHECK(cublasSscal(blas, n, &input.monthly_investment,
-                                 d_contrib, 1));
+        CUBLAS_CHECK(cublasSscal(
+            blas, n, &input.monthly_investment, d_contrib, 1
+        ));
 
         std::vector<float> total_value_series(months + 1, 0.0f);
         std::vector<float> annual_div_income_series(months + 1, 0.0f);
+
+        total_value_series[0] = current_total;
+
+        float initial_div_income = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            initial_div_income += h_initial_values[i] * h_annual_dividend[i];
+        }
+        annual_div_income_series[0] = initial_div_income;
+        float initial_monthly_div_income = initial_div_income / 12.0f;
 
         const int block_size = 256;
         const int grid_size = (n + block_size - 1) / block_size;
@@ -409,8 +471,7 @@ int main(int argc, char** argv) {
                 blas, n, d_values, 1, d_ones, 1, &total_value
             ));
             CUBLAS_CHECK(cublasSdot(
-                blas, n, d_values, 1, d_annual_dividend, 1,
-                &annual_div_income
+                blas, n, d_values, 1, d_annual_dividend, 1, &annual_div_income
             ));
 
             total_value_series[month] = total_value;
@@ -423,21 +484,42 @@ int main(int argc, char** argv) {
             annual_div_income_series
         );
 
+        float final_annual_div_income = annual_div_income_series.back();
+        float final_monthly_div_income = final_annual_div_income / 12.0f;
+
         std::cout << std::fixed << std::setprecision(2);
         std::cout << "Goal: " << input.goal << "\n";
+        std::cout << "Growth basis: " << input.growth_basis << "\n";
         std::cout << "Monthly investment: $" << input.monthly_investment << "\n";
-        std::cout << "Duration: " << input.years << " years\n\n";
+        std::cout << "Duration: " << input.years << " years\n";
+        std::cout << "Current portfolio value: $" << current_total << "\n\n";
 
-        std::cout << "Recommended allocations:\n";
+        std::cout << "Current vs Recommended allocations:\n";
         for (int i = 0; i < n; ++i) {
-            std::cout << "  " << input.stocks[i].ticker << ": "
-                      << (weights[i] * 100.0f) << "%\n";
+            const float active_growth =
+                active_growth_rate(input.stocks[i], input.growth_basis);
+
+            std::cout << "  " << input.stocks[i].ticker
+                      << " | current: " << (h_current_weights[i] * 100.0f)
+                      << "% | recommended: " << (weights[i] * 100.0f)
+                      << "% | growth: " << (active_growth * 100.0f)
+                      << "% | dividend: "
+                      << (input.stocks[i].dividend_yield * 100.0f)
+                      << "%\n";
         }
+
+        std::cout << "\nIncome comparison:\n";
+        std::cout << "  Current monthly dividend income: $"
+                  << initial_monthly_div_income << "\n";
+        std::cout << "  Current annual dividend income:  $"
+                  << initial_div_income << "\n";
+        std::cout << "  Projected monthly dividend income at end: $"
+                  << final_monthly_div_income << "\n";
+        std::cout << "  Projected annual dividend income at end:  $"
+                  << final_annual_div_income << "\n";
 
         std::cout << "\nProjected final value: $"
                   << total_value_series.back() << "\n";
-        std::cout << "Projected annual dividend income at end: $"
-                  << annual_div_income_series.back() << "\n";
         std::cout << "Wrote results to " << output_path << "\n";
 
         CUDA_CHECK(cudaFree(d_values));
