@@ -1,7 +1,7 @@
 #### Dylan Renard  
 #### EN.605.617 Introduction to GPU Programming (JHU)  
 #### Professor Chance Pascale  
-#### March 2026  
+#### March 22nd, 2026  
 
 # CUDA Dividend Portfolio Allocation Optimizer  
 ## GPU-Accelerated Portfolio Construction Using cuBLAS / cuSOLVER
@@ -41,17 +41,7 @@ This project explores:
 
 # System Architecture
 
-User Input (GUI)
-    ↓
-CSV / Barchart Loader
-    ↓
-Feature Matrix Construction
-    ↓
-CUDA Solver
-    ↓
-Portfolio Allocation Output
-    ↓
-CPU Baseline Comparison
+The system begins with user input through the GUI, where investment preferences, stock selections, and financial parameters are defined. These inputs are then passed to a data ingestion layer that processes either clean CSV files or raw Barchart exports, normalizing them into a consistent format. From there, a feature matrix is constructed, representing each stock in terms of its price, growth metrics, and dividend yield. This matrix is then fed into the CUDA-based solver, which performs the necessary linear algebra computations to determine optimal portfolio allocations. The resulting allocation is returned to the GUI for visualization, while a Python-based CPU baseline is executed in parallel to provide a direct performance and correctness comparison.
 
 ---
 
@@ -95,6 +85,8 @@ We solve:
 
 A * w = b
 
+This formulation allows the portfolio allocation problem to be expressed as a system of linear equations, enabling efficient parallel solution using GPU-accelerated linear algebra routines.
+
 Where:
 - A encodes relationships between stocks
 - w is the allocation vector
@@ -114,13 +106,15 @@ Libraries used:
 - cuBLAS → matrix operations
 - cuSOLVER → linear system solve
 
+cuBLAS is used to efficiently construct and manipulate the feature matrix A through optimized GPU matrix operations, while cuSOLVER consumes this matrix to solve the resulting linear system A * w = b. This demonstrates a tightly coupled pipeline where one library directly feeds into the other.
+
 ---
 
 # Performance Results
 
 ## Small Input (5 Stocks)
 
-![5 Stock Runtime](5 stock tickers.png)
+![5 Stock Runtime](5stocktickers.png)
 
 GPU runtime: ~1486 ms  
 CPU runtime: ~0.22 ms  
@@ -135,7 +129,7 @@ GPU is slower due to:
 
 ## Large Input (1000 Stocks)
 
-![1000 Stock Runtime](1000 stock tickers.png)
+![1000 Stock Runtime](1000stocktickers.png)
 
 GPU runtime: ~656 ms  
 CPU runtime: ~16294 ms  
@@ -160,65 +154,5 @@ This reflects a fundamental property of GPU computing:
 
 ---
 
-# GUI Features
-
-- CSV upload (single + batch)
-- Automatic Barchart conversion
-- Searchable stock table
-- Manual metric editing
-- Current holdings tracking
-- Dividend reinvestment toggle
-- GPU vs CPU runtime comparison
-
----
-
-# Code Quality and Structure
-
-- Modular design (GUI, solver, parser)
-- Clear separation of concerns
-- Cross-platform Makefile support
-- Reproducible workflow
-
----
-
-# Discussion
-
-This project demonstrates:
-
-- Practical use of CUDA in finance
-- Real-world performance tradeoffs
-- Integration of GPU computing with user-facing applications
-
-Compared to prior assignments, this system:
-- Uses real data
-- Solves a meaningful problem
-- Demonstrates scalability
-
----
-
-# Limitations
-
-- CAGR must be manually provided
-- Simplified allocation model
-- GUI scaling limits (Tkinter)
-
----
-
-# Future Work
-
-- API-based financial data ingestion
-- Risk modeling (covariance matrices)
-- Batch GPU simulations
-- Migration to scalable UI frameworks
-
----
-
 # Conclusion
-
-This project demonstrates that CUDA provides **conditional performance benefits** depending on problem size.
-
-It bridges the gap between:
-- Academic GPU exercises  
-- Real-world computational applications  
-
-and highlights the importance of **parallelism, scale, and system design** in GPU computing.
+This project highlights a key lesson in GPU computing: CUDA is not universally faster, but instead provides conditional performance benefits that emerge only when problem scale justifies parallel execution. Through direct comparison of small and large portfolio sizes, we observed the fundamental tradeoff between overhead and parallelism, where GPU execution is initially hindered by memory transfer and launch costs, but ultimately surpasses CPU performance as computational complexity increases. In doing so, this work bridges the gap between academic GPU exercises and real-world computational applications, demonstrating how theoretical concepts such as parallel linear algebra, workload scaling, and hardware utilization translate into practical decision-support tools. More broadly, it emphasizes that effective GPU programming is not just about writing kernels, but about understanding when and why to use the GPU, designing systems that scale appropriately, and aligning computational strategies with the structure of the underlying problem.
