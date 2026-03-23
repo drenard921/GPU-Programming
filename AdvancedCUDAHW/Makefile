@@ -36,7 +36,4 @@ gui: $(TARGET)
 	$(PYTHON) gui.py
 
 clean:
-	$(RM) $(TARGET) 2>nul || true
-	$(RM) results.csv 2>nul || true
-	$(RM) results_python.csv 2>nul || true
-	$(RM) normalized_import.csv 2>nul || true
+	rm -f $(TARGET) *.o
