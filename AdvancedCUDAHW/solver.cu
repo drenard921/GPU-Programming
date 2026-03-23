@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cctype>
 #include <fstream>
 #include <iomanip>
@@ -36,6 +37,7 @@ struct Stock {
     float cagr_5y = 0.0f;
     float dividend_yield = 0.0f;
     float current_holding = 0.0f;
+    int reinvest_dividends = 1;
 };
 
 struct InputData {
@@ -140,17 +142,18 @@ static InputData read_input_csv(const std::string& path) {
                 data.goal = cols[1];
             } else if (cols.size() >= 2 && cols[0] == "growth_basis") {
                 data.growth_basis = cols[1];
-            } else if (cols.size() >= 6 &&
+            } else if (cols.size() >= 7 &&
                        cols[0] == "ticker" &&
                        cols[1] == "price_now" &&
                        cols[2] == "cagr_3y" &&
                        cols[3] == "cagr_5y" &&
                        cols[4] == "dividend_yield" &&
-                       cols[5] == "current_holding") {
+                       cols[5] == "current_holding" &&
+                       cols[6] == "reinvest_dividends") {
                 in_stock_table = true;
             }
         } else {
-            if (cols.size() < 6) {
+            if (cols.size() < 7) {
                 continue;
             }
 
@@ -161,6 +164,7 @@ static InputData read_input_csv(const std::string& path) {
             s.cagr_5y = std::stof(cols[3]);
             s.dividend_yield = std::stof(cols[4]);
             s.current_holding = std::stof(cols[5]);
+            s.reinvest_dividends = std::stoi(cols[6]) != 0 ? 1 : 0;
             data.stocks.push_back(s);
         }
     }
@@ -321,39 +325,57 @@ static std::vector<float> solve_weights_with_cusolver(
 
 __global__ void monthly_update_kernel(
     float* values,
-    const float* monthly_return_rates,
+    float* cash_dividends,
+    const float* monthly_growth_rates,
+    const float* monthly_dividend_rates,
     const float* contribution_vector,
+    const int* reinvest_flags,
     int n
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        values[i] = values[i] * (1.0f + monthly_return_rates[i]) +
-                    contribution_vector[i];
+        float start_value = values[i];
+        float dividend_cash = start_value * monthly_dividend_rates[i];
+        float end_value = start_value * (1.0f + monthly_growth_rates[i]) +
+                          contribution_vector[i];
+
+        if (reinvest_flags[i] != 0) {
+            end_value += dividend_cash;
+        } else {
+            cash_dividends[i] += dividend_cash;
+        }
+
+        values[i] = end_value;
     }
 }
 
 static void write_results_csv(
     const std::string& path,
-    const std::vector<float>& totals,
-    const std::vector<float>& dividends
+    const std::vector<float>& invested_totals,
+    const std::vector<float>& cash_totals,
+    const std::vector<float>& annual_dividends
 ) {
     std::ofstream out(path);
     if (!out) {
         throw std::runtime_error("Failed to open output file: " + path);
     }
 
-    out << "month,total_value,total_dividend_income,monthly_dividend_income\n";
-    for (size_t i = 0; i < totals.size(); ++i) {
+    out << "month,invested_value,cash_dividends,total_value,total_dividend_income,monthly_dividend_income\n";
+    for (size_t i = 0; i < invested_totals.size(); ++i) {
         out << i << ","
             << std::fixed << std::setprecision(2)
-            << totals[i] << ","
-            << dividends[i] << ","
-            << (dividends[i] / 12.0f) << "\n";
+            << invested_totals[i] << ","
+            << cash_totals[i] << ","
+            << (invested_totals[i] + cash_totals[i]) << ","
+            << annual_dividends[i] << ","
+            << (annual_dividends[i] / 12.0f) << "\n";
     }
 }
 
 int main(int argc, char** argv) {
     try {
+        const auto backend_start = std::chrono::high_resolution_clock::now();
+
         if (argc != 3) {
             std::cerr << "Usage: " << argv[0]
                       << " input.csv results.csv\n";
@@ -373,10 +395,12 @@ int main(int argc, char** argv) {
         std::vector<float> weights = solve_weights_with_cusolver(scores);
 
         std::vector<float> h_initial_values(n, 0.0f);
-        std::vector<float> h_monthly_return(n, 0.0f);
+        std::vector<float> h_monthly_growth(n, 0.0f);
         std::vector<float> h_annual_dividend(n, 0.0f);
+        std::vector<float> h_monthly_dividend(n, 0.0f);
         std::vector<float> h_ones(n, 1.0f);
         std::vector<float> h_current_weights(n, 0.0f);
+        std::vector<int> h_reinvest_flags(n, 0);
 
         float current_total = 0.0f;
         for (int i = 0; i < n; ++i) {
@@ -395,33 +419,45 @@ int main(int argc, char** argv) {
                 active_growth_rate(input.stocks[i], input.growth_basis);
             const float annual_div = input.stocks[i].dividend_yield;
 
-            h_monthly_return[i] = (annual_growth + annual_div) / 12.0f;
+            h_monthly_growth[i] = annual_growth / 12.0f;
             h_annual_dividend[i] = annual_div;
+            h_monthly_dividend[i] = annual_div / 12.0f;
+            h_reinvest_flags[i] = input.stocks[i].reinvest_dividends;
         }
 
         cublasHandle_t blas = nullptr;
         CUBLAS_CHECK(cublasCreate(&blas));
 
         float* d_values = nullptr;
-        float* d_monthly_return = nullptr;
+        float* d_monthly_growth = nullptr;
+        float* d_monthly_dividend = nullptr;
         float* d_contrib = nullptr;
         float* d_weights = nullptr;
         float* d_ones = nullptr;
         float* d_annual_dividend = nullptr;
+        float* d_cash_dividends = nullptr;
+        int* d_reinvest_flags = nullptr;
 
         CUDA_CHECK(cudaMalloc(&d_values, sizeof(float) * n));
-        CUDA_CHECK(cudaMalloc(&d_monthly_return, sizeof(float) * n));
+        CUDA_CHECK(cudaMalloc(&d_monthly_growth, sizeof(float) * n));
+        CUDA_CHECK(cudaMalloc(&d_monthly_dividend, sizeof(float) * n));
         CUDA_CHECK(cudaMalloc(&d_contrib, sizeof(float) * n));
         CUDA_CHECK(cudaMalloc(&d_weights, sizeof(float) * n));
         CUDA_CHECK(cudaMalloc(&d_ones, sizeof(float) * n));
         CUDA_CHECK(cudaMalloc(&d_annual_dividend, sizeof(float) * n));
+        CUDA_CHECK(cudaMalloc(&d_cash_dividends, sizeof(float) * n));
+        CUDA_CHECK(cudaMalloc(&d_reinvest_flags, sizeof(int) * n));
 
         CUDA_CHECK(cudaMemcpy(
             d_values, h_initial_values.data(), sizeof(float) * n,
             cudaMemcpyHostToDevice
         ));
         CUDA_CHECK(cudaMemcpy(
-            d_monthly_return, h_monthly_return.data(), sizeof(float) * n,
+            d_monthly_growth, h_monthly_growth.data(), sizeof(float) * n,
+            cudaMemcpyHostToDevice
+        ));
+        CUDA_CHECK(cudaMemcpy(
+            d_monthly_dividend, h_monthly_dividend.data(), sizeof(float) * n,
             cudaMemcpyHostToDevice
         ));
         CUDA_CHECK(cudaMemcpy(
@@ -436,15 +472,23 @@ int main(int argc, char** argv) {
             d_annual_dividend, h_annual_dividend.data(), sizeof(float) * n,
             cudaMemcpyHostToDevice
         ));
+        CUDA_CHECK(cudaMemcpy(
+            d_reinvest_flags, h_reinvest_flags.data(), sizeof(int) * n,
+            cudaMemcpyHostToDevice
+        ));
+        CUDA_CHECK(cudaMemset(d_cash_dividends, 0, sizeof(float) * n));
 
         CUBLAS_CHECK(cublasScopy(blas, n, d_weights, 1, d_contrib, 1));
         CUBLAS_CHECK(cublasSscal(
             blas, n, &input.monthly_investment, d_contrib, 1
         ));
 
+        std::vector<float> invested_value_series(months + 1, 0.0f);
+        std::vector<float> cash_dividend_series(months + 1, 0.0f);
         std::vector<float> total_value_series(months + 1, 0.0f);
         std::vector<float> annual_div_income_series(months + 1, 0.0f);
 
+        invested_value_series[0] = current_total;
         total_value_series[0] = current_total;
 
         float initial_div_income = 0.0f;
@@ -457,33 +501,57 @@ int main(int argc, char** argv) {
         const int block_size = 256;
         const int grid_size = (n + block_size - 1) / block_size;
 
+        cudaEvent_t sim_start = nullptr;
+        cudaEvent_t sim_stop = nullptr;
+        CUDA_CHECK(cudaEventCreate(&sim_start));
+        CUDA_CHECK(cudaEventCreate(&sim_stop));
+        CUDA_CHECK(cudaEventRecord(sim_start));
+
         for (int month = 1; month <= months; ++month) {
             monthly_update_kernel<<<grid_size, block_size>>>(
-                d_values, d_monthly_return, d_contrib, n
+                d_values, d_cash_dividends, d_monthly_growth,
+                d_monthly_dividend, d_contrib, d_reinvest_flags, n
             );
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
 
-            float total_value = 0.0f;
+            float invested_value = 0.0f;
+            float cash_dividends = 0.0f;
             float annual_div_income = 0.0f;
 
             CUBLAS_CHECK(cublasSdot(
-                blas, n, d_values, 1, d_ones, 1, &total_value
+                blas, n, d_values, 1, d_ones, 1, &invested_value
+            ));
+            CUBLAS_CHECK(cublasSdot(
+                blas, n, d_cash_dividends, 1, d_ones, 1, &cash_dividends
             ));
             CUBLAS_CHECK(cublasSdot(
                 blas, n, d_values, 1, d_annual_dividend, 1, &annual_div_income
             ));
 
-            total_value_series[month] = total_value;
+            invested_value_series[month] = invested_value;
+            cash_dividend_series[month] = cash_dividends;
+            total_value_series[month] = invested_value + cash_dividends;
             annual_div_income_series[month] = annual_div_income;
         }
 
+        CUDA_CHECK(cudaEventRecord(sim_stop));
+        CUDA_CHECK(cudaEventSynchronize(sim_stop));
+        float gpu_simulation_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(
+            &gpu_simulation_ms, sim_start, sim_stop
+        ));
+
         write_results_csv(
             output_path,
-            total_value_series,
+            invested_value_series,
+            cash_dividend_series,
             annual_div_income_series
         );
 
+        float final_invested_value = invested_value_series.back();
+        float final_cash_dividends = cash_dividend_series.back();
+        float final_total_value = total_value_series.back();
         float final_annual_div_income = annual_div_income_series.back();
         float final_monthly_div_income = final_annual_div_income / 12.0f;
 
@@ -505,7 +573,9 @@ int main(int argc, char** argv) {
                       << "% | growth: " << (active_growth * 100.0f)
                       << "% | dividend: "
                       << (input.stocks[i].dividend_yield * 100.0f)
-                      << "%\n";
+                      << "% | reinvest: "
+                      << (input.stocks[i].reinvest_dividends != 0 ? "yes" : "no")
+                      << "\n";
         }
 
         std::cout << "\nIncome comparison:\n";
@@ -523,11 +593,14 @@ int main(int argc, char** argv) {
         std::cout << "Wrote results to " << output_path << "\n";
 
         CUDA_CHECK(cudaFree(d_values));
-        CUDA_CHECK(cudaFree(d_monthly_return));
+        CUDA_CHECK(cudaFree(d_monthly_growth));
+        CUDA_CHECK(cudaFree(d_monthly_dividend));
         CUDA_CHECK(cudaFree(d_contrib));
         CUDA_CHECK(cudaFree(d_weights));
         CUDA_CHECK(cudaFree(d_ones));
         CUDA_CHECK(cudaFree(d_annual_dividend));
+        CUDA_CHECK(cudaFree(d_cash_dividends));
+        CUDA_CHECK(cudaFree(d_reinvest_flags));
         CUBLAS_CHECK(cublasDestroy(blas));
 
         return 0;
