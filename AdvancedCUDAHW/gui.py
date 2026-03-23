@@ -6,17 +6,19 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, messagebox, filedialog
 
+from barchart import normalize_csv_file, normalize_csv_folder, write_app_csv
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "stocks.csv"
 INPUT_FILE = BASE_DIR / "input.csv"
 RESULTS_FILE = BASE_DIR / "results.csv"
 PY_RESULTS_FILE = BASE_DIR / "results_python.csv"
+NORMALIZED_IMPORT_FILE = BASE_DIR / "normalized_import.csv"
 
 if platform.system() == "Windows":
     BACKEND_EXE = BASE_DIR / "solver_app.exe"
 else:
     BACKEND_EXE = BASE_DIR / "solver_app"
-
 
 ALPHA = 0.25
 
@@ -247,25 +249,46 @@ class PortfolioApp:
     def __init__(self, root):
         self.root = root
         self.root.title("CUDA Dividend Portfolio Allocation Optimizer")
-        self.root.geometry("1450x920")
+        self.root.geometry("1550x940")
 
         self.all_stocks = load_stocks()
         self.stocks = [dict(stock) for stock in self.all_stocks]
+
         self.selected = {}
         self.holding_vars = {}
         self.reinvest_vars = {}
+        self.cagr3_vars = {}
+        self.cagr5_vars = {}
+        self.dividend_vars = {}
+
+        self.search_var = tk.StringVar()
+        self.show_selected_only = False
+        self.show_incomplete_only = False
 
         self.stock_frame = None
         self.stock_canvas = None
         self.stock_canvas_window = None
         self.stock_vscroll = None
         self.stock_hscroll = None
+        self.import_status_var = tk.StringVar(value="")
 
         self.stock_source_var = tk.StringVar(
             value=f"Built-in dataset: {DATA_FILE.name}"
         )
 
         self._build_ui()
+        self.initialize_row_vars(self.stocks)
+        self.render_stock_rows()
+        self.search_after_id = None
+
+    def on_search_changed(self, *_args):
+        if self.search_after_id is not None:
+            self.root.after_cancel(self.search_after_id)
+        self.search_after_id = self.root.after(200, self.apply_search)
+
+    def apply_search(self):
+        self.search_after_id = None
+        self.render_stock_rows()
 
     def normalize_bool(self, value, default=False):
         if value is None:
@@ -291,12 +314,7 @@ class PortfolioApp:
                 if k is not None
             }
 
-            ticker = (
-                clean.get("ticker")
-                or clean.get("symbol")
-                or ""
-            ).upper().strip()
-
+            ticker = (clean.get("ticker") or clean.get("symbol") or "").upper().strip()
             if not ticker:
                 continue
 
@@ -350,6 +368,135 @@ class PortfolioApp:
 
         return deduped
 
+    def initialize_row_vars(self, stocks, clear_existing=True):
+        if clear_existing:
+            self.selected = {}
+            self.holding_vars = {}
+            self.reinvest_vars = {}
+            self.cagr3_vars = {}
+            self.cagr5_vars = {}
+            self.dividend_vars = {}
+
+        for i, stock in enumerate(stocks, start=1):
+            ticker = stock["ticker"]
+
+            self.selected[ticker] = tk.BooleanVar(
+                value=stock.get("selected_default", i <= 4)
+            )
+            self.holding_vars[ticker] = tk.StringVar(
+                value=str(stock.get("current_holding_default", "0"))
+            )
+            self.reinvest_vars[ticker] = tk.BooleanVar(
+                value=stock.get("reinvest_default", True)
+            )
+            self.cagr3_vars[ticker] = tk.StringVar(
+                value=str(stock.get("cagr_3y", 0.0))
+            )
+            self.cagr5_vars[ticker] = tk.StringVar(
+                value=str(stock.get("cagr_5y", 0.0))
+            )
+            self.dividend_vars[ticker] = tk.StringVar(
+                value=str(stock.get("dividend_yield", 0.0))
+            )
+
+    def get_stock_display_value(self, ticker, field_name, fallback):
+        try:
+            if field_name == "cagr_3y":
+                return float(self.cagr3_vars[ticker].get())
+            if field_name == "cagr_5y":
+                return float(self.cagr5_vars[ticker].get())
+            if field_name == "dividend_yield":
+                return float(self.dividend_vars[ticker].get())
+        except (ValueError, KeyError):
+            return fallback
+        return fallback
+
+    def stock_is_incomplete(self, ticker, stock):
+        c3 = self.get_stock_display_value(ticker, "cagr_3y", stock.get("cagr_3y", 0.0))
+        c5 = self.get_stock_display_value(ticker, "cagr_5y", stock.get("cagr_5y", 0.0))
+        dy = self.get_stock_display_value(
+            ticker, "dividend_yield", stock.get("dividend_yield", 0.0)
+        )
+        return c3 == 0.0 or c5 == 0.0 or dy == 0.0
+
+    def get_filtered_stocks(self):
+        search_text = self.search_var.get().strip().lower()
+        filtered = []
+
+        for stock in self.stocks:
+            ticker = stock["ticker"]
+            if search_text and search_text not in ticker.lower():
+                continue
+            if self.show_selected_only and not self.selected[ticker].get():
+                continue
+            if self.show_incomplete_only and not self.stock_is_incomplete(ticker, stock):
+                continue
+            filtered.append(stock)
+
+        return filtered
+
+    def update_stocks_from_current_vars(self):
+        for stock in self.stocks:
+            ticker = stock["ticker"]
+            if ticker in self.cagr3_vars:
+                try:
+                    stock["cagr_3y"] = float(self.cagr3_vars[ticker].get())
+                except ValueError:
+                    pass
+            if ticker in self.cagr5_vars:
+                try:
+                    stock["cagr_5y"] = float(self.cagr5_vars[ticker].get())
+                except ValueError:
+                    pass
+            if ticker in self.dividend_vars:
+                try:
+                    stock["dividend_yield"] = float(self.dividend_vars[ticker].get())
+                except ValueError:
+                    pass
+            if ticker in self.holding_vars:
+                stock["current_holding_default"] = self.holding_vars[ticker].get()
+            if ticker in self.reinvest_vars:
+                stock["reinvest_default"] = self.reinvest_vars[ticker].get()
+            if ticker in self.selected:
+                stock["selected_default"] = self.selected[ticker].get()
+
+    def persist_normalized_import(self):
+        self.update_stocks_from_current_vars()
+        write_rows = []
+        for stock in self.stocks:
+            ticker = stock["ticker"]
+            try:
+                current_holding = float(self.holding_vars[ticker].get())
+            except ValueError:
+                current_holding = 0.0
+
+            try:
+                cagr_3y = float(self.cagr3_vars[ticker].get())
+            except ValueError:
+                cagr_3y = stock.get("cagr_3y", 0.0)
+
+            try:
+                cagr_5y = float(self.cagr5_vars[ticker].get())
+            except ValueError:
+                cagr_5y = stock.get("cagr_5y", 0.0)
+
+            try:
+                dividend_yield = float(self.dividend_vars[ticker].get())
+            except ValueError:
+                dividend_yield = stock.get("dividend_yield", 0.0)
+
+            write_rows.append({
+                "ticker": ticker,
+                "price_now": stock["price_now"],
+                "cagr_3y": cagr_3y,
+                "cagr_5y": cagr_5y,
+                "dividend_yield": dividend_yield,
+                "current_holding": current_holding,
+                "reinvest_dividends": int(self.reinvest_vars[ticker].get()),
+            })
+
+        write_app_csv(write_rows, NORMALIZED_IMPORT_FILE)
+
     def load_stock_csv_file(self):
         path = filedialog.askopenfilename(
             title="Select stock picks CSV",
@@ -360,15 +507,35 @@ class PortfolioApp:
             return
 
         try:
-            with open(path, newline="", encoding="utf-8-sig") as f:
-                rows = list(csv.DictReader(f))
-            stocks = self.merge_stock_rows(rows)
+            normalized_rows, detected_format = normalize_csv_file(path, DATA_FILE)
+            stocks = self.merge_stock_rows(normalized_rows)
+
             self.stocks = stocks
-            self.stock_source_var.set(f"Imported file: {Path(path).name}")
+            self.initialize_row_vars(self.stocks, clear_existing=True)
+            self.stock_source_var.set(
+                f"Imported file: {Path(path).name} [{detected_format}]"
+            )
+
+            incomplete_count = sum(
+                1 for stock in self.stocks if self.stock_is_incomplete(stock["ticker"], stock)
+            )
+            if detected_format != "app" and incomplete_count > 0:
+                self.import_status_var.set(
+                    f"Imported {len(self.stocks)} rows. "
+                    f"{incomplete_count} row(s) have 0.0 CAGR/yield values and may need manual enrichment."
+                )
+            else:
+                self.import_status_var.set(
+                    f"Imported {len(self.stocks)} rows successfully."
+                )
+
             self.render_stock_rows()
+            self.persist_normalized_import()
+
             messagebox.showinfo(
                 "Import complete",
-                f"Loaded {len(self.stocks)} stock rows from {Path(path).name}.",
+                f"Loaded {len(self.stocks)} stock rows from {Path(path).name} "
+                f"as {detected_format}.",
             )
         except Exception as e:
             messagebox.showerror("CSV import failed", str(e))
@@ -383,32 +550,56 @@ class PortfolioApp:
             return
 
         try:
-            csv_paths = sorted(Path(folder).glob("*.csv"))
-            if not csv_paths:
-                raise ValueError("No CSV files were found in the selected folder.")
+            normalized_rows, detected_formats = normalize_csv_folder(folder, DATA_FILE)
+            stocks = self.merge_stock_rows(normalized_rows)
 
-            rows = []
-            for csv_path in csv_paths:
-                with open(csv_path, newline="", encoding="utf-8-sig") as f:
-                    rows.extend(list(csv.DictReader(f)))
-
-            stocks = self.merge_stock_rows(rows)
             self.stocks = stocks
+            self.initialize_row_vars(self.stocks, clear_existing=True)
+            unique_formats = sorted(set(detected_formats))
             self.stock_source_var.set(
-                f"Imported folder: {Path(folder).name} ({len(csv_paths)} CSVs)"
+                f"Imported folder: {Path(folder).name} [{', '.join(unique_formats)}]"
             )
+
+            incomplete_count = sum(
+                1 for stock in self.stocks if self.stock_is_incomplete(stock["ticker"], stock)
+            )
+            if any(fmt != "app" for fmt in unique_formats) and incomplete_count > 0:
+                self.import_status_var.set(
+                    f"Imported {len(self.stocks)} rows. "
+                    f"{incomplete_count} row(s) have 0.0 CAGR/yield values and may need manual enrichment."
+                )
+            else:
+                self.import_status_var.set(
+                    f"Imported {len(self.stocks)} rows successfully."
+                )
+
             self.render_stock_rows()
+            self.persist_normalized_import()
+
             messagebox.showinfo(
                 "Folder import complete",
-                f"Loaded {len(self.stocks)} unique stock rows from {len(csv_paths)} CSV file(s).",
+                f"Loaded {len(self.stocks)} unique stock rows from {Path(folder).name}. "
+                f"Detected formats: {', '.join(unique_formats)}",
             )
         except Exception as e:
             messagebox.showerror("Folder import failed", str(e))
 
     def reset_to_default_stocks(self):
+        self.search_var.set("")
+        self.show_selected_only = False
+        self.show_incomplete_only = False
+
         self.stocks = [dict(stock) for stock in self.all_stocks]
+        self.initialize_row_vars(self.stocks, clear_existing=True)
         self.stock_source_var.set(f"Built-in dataset: {DATA_FILE.name}")
+        self.import_status_var.set("")
         self.render_stock_rows()
+
+        if NORMALIZED_IMPORT_FILE.exists():
+            try:
+                NORMALIZED_IMPORT_FILE.unlink()
+            except OSError:
+                pass
 
     def on_stock_frame_configure(self, _event=None):
         if self.stock_canvas is not None:
@@ -416,10 +607,7 @@ class PortfolioApp:
 
     def on_stock_canvas_configure(self, event):
         if self.stock_canvas is not None and self.stock_canvas_window is not None:
-            self.stock_canvas.itemconfigure(
-                self.stock_canvas_window,
-                width=event.width,
-            )
+            self.stock_canvas.itemconfigure(self.stock_canvas_window, width=event.width)
 
     def _bind_mousewheel(self):
         self.stock_canvas.bind_all("<MouseWheel>", self._on_mousewheel_windows)
@@ -446,16 +634,31 @@ class PortfolioApp:
     def select_all_stocks(self):
         for var in self.selected.values():
             var.set(True)
+        self.render_stock_rows()
 
     def clear_all_stocks(self):
         for var in self.selected.values():
             var.set(False)
+        self.render_stock_rows()
+
+    def show_all_rows(self):
+        self.show_selected_only = False
+        self.show_incomplete_only = False
+        self.render_stock_rows()
+
+    def toggle_selected_filter(self):
+        self.show_selected_only = not self.show_selected_only
+        if self.show_selected_only:
+            self.show_incomplete_only = False
+        self.render_stock_rows()
+
+    def toggle_incomplete_filter(self):
+        self.show_incomplete_only = not self.show_incomplete_only
+        if self.show_incomplete_only:
+            self.show_selected_only = False
+        self.render_stock_rows()
 
     def render_stock_rows(self):
-        self.selected = {}
-        self.holding_vars = {}
-        self.reinvest_vars = {}
-
         for child in self.stock_frame.winfo_children():
             child.destroy()
 
@@ -477,51 +680,60 @@ class PortfolioApp:
                 font=("Arial", 10, "bold"),
             ).grid(row=0, column=col, sticky="w", padx=8, pady=4)
 
-        for i, stock in enumerate(self.stocks, start=1):
+        filtered_stocks = self.get_filtered_stocks()
+
+        for row_idx, stock in enumerate(filtered_stocks, start=1):
             ticker = stock["ticker"]
-
-            selected_var = tk.BooleanVar(value=stock.get("selected_default", i <= 4))
-            holding_var = tk.StringVar(
-                value=str(stock.get("current_holding_default", "0"))
-            )
-            reinvest_var = tk.BooleanVar(value=stock.get("reinvest_default", True))
-
-            self.selected[ticker] = selected_var
-            self.holding_vars[ticker] = holding_var
-            self.reinvest_vars[ticker] = reinvest_var
 
             ttk.Checkbutton(
                 self.stock_frame,
-                variable=selected_var,
-            ).grid(row=i, column=0, padx=8, pady=3, sticky="w")
+                variable=self.selected[ticker],
+                command=self.on_stock_frame_configure,
+            ).grid(row=row_idx, column=0, padx=8, pady=3, sticky="w")
 
             ttk.Label(self.stock_frame, text=ticker).grid(
-                row=i, column=1, padx=8, pady=3, sticky="w"
+                row=row_idx, column=1, padx=8, pady=3, sticky="w"
             )
+
             ttk.Label(self.stock_frame, text=f'${stock["price_now"]:.2f}').grid(
-                row=i, column=2, padx=8, pady=3, sticky="w"
+                row=row_idx, column=2, padx=8, pady=3, sticky="w"
             )
-            ttk.Label(self.stock_frame, text=f'{stock["cagr_3y"] * 100:.2f}%').grid(
-                row=i, column=3, padx=8, pady=3, sticky="w"
-            )
-            ttk.Label(self.stock_frame, text=f'{stock["cagr_5y"] * 100:.2f}%').grid(
-                row=i, column=4, padx=8, pady=3, sticky="w"
-            )
-            ttk.Label(
-                self.stock_frame,
-                text=f'{stock["dividend_yield"] * 100:.2f}%',
-            ).grid(row=i, column=5, padx=8, pady=3, sticky="w")
 
             ttk.Entry(
                 self.stock_frame,
-                textvariable=holding_var,
+                textvariable=self.cagr3_vars[ticker],
+                width=12,
+            ).grid(row=row_idx, column=3, padx=8, pady=3, sticky="w")
+
+            ttk.Entry(
+                self.stock_frame,
+                textvariable=self.cagr5_vars[ticker],
+                width=12,
+            ).grid(row=row_idx, column=4, padx=8, pady=3, sticky="w")
+
+            ttk.Entry(
+                self.stock_frame,
+                textvariable=self.dividend_vars[ticker],
+                width=12,
+            ).grid(row=row_idx, column=5, padx=8, pady=3, sticky="w")
+
+            ttk.Entry(
+                self.stock_frame,
+                textvariable=self.holding_vars[ticker],
                 width=14,
-            ).grid(row=i, column=6, padx=8, pady=3, sticky="w")
+            ).grid(row=row_idx, column=6, padx=8, pady=3, sticky="w")
 
             ttk.Checkbutton(
                 self.stock_frame,
-                variable=reinvest_var,
-            ).grid(row=i, column=7, padx=8, pady=3, sticky="w")
+                variable=self.reinvest_vars[ticker],
+            ).grid(row=row_idx, column=7, padx=8, pady=3, sticky="w")
+
+        if not filtered_stocks:
+            ttk.Label(
+                self.stock_frame,
+                text="No stocks match the current filters.",
+                font=("Arial", 10, "italic"),
+            ).grid(row=1, column=0, columnspan=len(headers), padx=8, pady=10, sticky="w")
 
         for col in range(len(headers)):
             self.stock_frame.grid_columnconfigure(col, weight=1)
@@ -605,7 +817,13 @@ class PortfolioApp:
             import_frame,
             textvariable=self.stock_source_var,
             font=("Arial", 10, "bold"),
-        ).pack(anchor="w", pady=(0, 6))
+        ).pack(anchor="w", pady=(0, 4))
+
+        ttk.Label(
+            import_frame,
+            textvariable=self.import_status_var,
+            foreground="darkblue",
+        ).pack(anchor="w", pady=(0, 8))
 
         import_buttons = ttk.Frame(import_frame)
         import_buttons.pack(fill="x")
@@ -643,17 +861,53 @@ class PortfolioApp:
             command=self.clear_all_stocks,
         ).pack(side="left", padx=5)
 
+        filter_frame = ttk.Frame(import_frame)
+        filter_frame.pack(fill="x", pady=(8, 0))
+
+        ttk.Label(filter_frame, text="Search ticker:").pack(side="left", padx=5)
+
+        search_entry = ttk.Entry(filter_frame, textvariable=self.search_var, width=20)
+        search_entry.pack(side="left", padx=5)
+        self.search_var.trace_add("write", self.on_search_changed)
+
+        ttk.Button(
+            filter_frame,
+            text="Show All",
+            command=self.show_all_rows,
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            filter_frame,
+            text="Show Selected Only",
+            command=self.toggle_selected_filter,
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            filter_frame,
+            text="Show Incomplete Only",
+            command=self.toggle_incomplete_filter,
+        ).pack(side="left", padx=5)
+
         stock_container = ttk.LabelFrame(
             self.root,
-            text="Select Stocks and Current Holdings",
+            text="Select Stocks and Edit Enrichment Fields",
             padding=10,
         )
         stock_container.pack(fill="both", expand=False, padx=10, pady=10)
 
+        notes = ttk.Label(
+            stock_container,
+            text=(
+                "For raw Barchart snapshot imports, 3Y CAGR, 5Y CAGR, and Dividend Yield "
+                "may load as 0.0. You can edit those fields manually before running."
+            ),
+        )
+        notes.pack(anchor="w", pady=(0, 8))
+
         canvas_holder = ttk.Frame(stock_container)
         canvas_holder.pack(fill="both", expand=True)
 
-        self.stock_canvas = tk.Canvas(canvas_holder, height=320)
+        self.stock_canvas = tk.Canvas(canvas_holder, height=340)
         self.stock_vscroll = ttk.Scrollbar(
             canvas_holder,
             orient="vertical",
@@ -687,10 +941,14 @@ class PortfolioApp:
         self.stock_canvas.bind("<Enter>", lambda _e: self._bind_mousewheel())
         self.stock_canvas.bind("<Leave>", lambda _e: self._unbind_mousewheel())
 
-        self.render_stock_rows()
-
         button_frame = ttk.Frame(self.root, padding=10)
         button_frame.pack(fill="x")
+
+        ttk.Button(
+            button_frame,
+            text="Save Current Import CSV",
+            command=self.persist_normalized_import,
+        ).pack(side="left", padx=5)
 
         ttk.Button(
             button_frame,
@@ -774,10 +1032,7 @@ class PortfolioApp:
             goal = self.goal_var.get()
             growth_basis = self.growth_basis_var.get()
         except ValueError:
-            messagebox.showerror(
-                "Invalid input",
-                "Please enter valid numeric inputs.",
-            )
+            messagebox.showerror("Invalid input", "Please enter valid numeric inputs.")
             return None
 
         if monthly <= 0 or years <= 0:
@@ -807,17 +1062,28 @@ class PortfolioApp:
                     )
                     return None
 
+                try:
+                    cagr_3y = float(self.cagr3_vars[ticker].get())
+                    cagr_5y = float(self.cagr5_vars[ticker].get())
+                    dividend_yield = float(self.dividend_vars[ticker].get())
+                except ValueError:
+                    messagebox.showerror(
+                        "Invalid enrichment value",
+                        f"CAGR and dividend yield for {ticker} must be numeric decimals.",
+                    )
+                    return None
+
                 chosen.append({
                     **stock,
+                    "cagr_3y": cagr_3y,
+                    "cagr_5y": cagr_5y,
+                    "dividend_yield": dividend_yield,
                     "current_holding": current_holding,
                     "reinvest_dividends": self.reinvest_vars[ticker].get(),
                 })
 
         if len(chosen) < 2:
-            messagebox.showerror(
-                "Selection error",
-                "Please select at least 2 stocks.",
-            )
+            messagebox.showerror("Selection error", "Please select at least 2 stocks.")
             return None
 
         return monthly, years, goal, growth_basis, chosen
@@ -829,6 +1095,7 @@ class PortfolioApp:
 
         monthly, years, goal, growth_basis, chosen = gathered
         self.write_input_csv(chosen, monthly, years, goal, growth_basis)
+        self.persist_normalized_import()
 
         gpu_wall_ms = None
         py_ms = None
@@ -875,10 +1142,7 @@ class PortfolioApp:
             )
             return
         except OSError as e:
-            self.gpu_output.insert(
-                tk.END,
-                f"Backend launch failed:\n{e}\n",
-            )
+            self.gpu_output.insert(tk.END, f"Backend launch failed:\n{e}\n")
             return
         except subprocess.CalledProcessError as e:
             self.gpu_output.insert(tk.END, "Backend failed.\n\n")
