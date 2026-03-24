@@ -2,11 +2,17 @@
 
 #include <vector>
 #include <GLFW/glfw3.h>
-
-#include "renderer.h"
 #include "types.h"
 
-std::vector<Particle> initParticles(int nFluid, int nCells, float radius, float height);
+std::vector<Particle> initParticles(
+    int nFluid,
+    int nCells,
+    float height,
+    float outerBase,
+    float outerTip,
+    float innerBase,
+    float innerTip
+);
 
 void updateSystem(
     std::vector<Bag>& bags,
@@ -16,6 +22,16 @@ void updateSystem(
     float dt
 );
 
-void updateParticles(std::vector<Particle>& particles, float dt, float gForce, float flow);
+void updateParticles(
+    std::vector<Particle>& particles,
+    float dt,
+    float gForce,
+    float flow,
+    float height,
+    float outerBase,
+    float outerTip,
+    float innerBase,
+    float innerTip
+);
 
 void processInput(GLFWwindow* window, float& gForce, float& flow);

@@ -16,28 +16,54 @@ namespace {
 }
 
 
-std::vector<Particle> initParticles(int nFluid, int nCells, float radius, float height) {
+static float outerRadiusAtY(float y, float height, float outerBase, float outerTip) {
+    float t = (y + height * 0.5f) / height;
+    return outerBase + (outerTip - outerBase) * t;
+}
+
+static float innerRadiusAtY(float y, float height, float innerBase, float innerTip) {
+    float t = (y + height * 0.5f) / height;
+    return innerBase + (innerTip - innerBase) * t;
+}
+
+std::vector<Particle> initParticles(
+    int nFluid,
+    int nCells,
+    float height,
+    float outerBase,
+    float outerTip,
+    float innerBase,
+    float innerTip
+) {
     std::vector<Particle> particles;
     particles.reserve(nFluid + nCells);
 
     std::mt19937 rng(42);
-    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
     std::uniform_real_distribution<float> uy(-height * 0.5f, height * 0.5f);
+    std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    std::uniform_real_distribution<float> uang(0.0f, 2.0f * 3.14159265f);
 
-    auto sampleInCylinder = [&](int type) {
+    auto sampleInShell = [&](int type) {
         while (true) {
-            float x = u(rng) * radius;
-            float z = u(rng) * radius;
-            if (x * x + z * z <= radius * radius) {
-                float y = uy(rng);
-                particles.push_back({x, y, z, type});
-                return;
-            }
+            float y = uy(rng);
+
+            float rOuter = outerRadiusAtY(y, height, outerBase, outerTip);
+            float rInner = innerRadiusAtY(y, height, innerBase, innerTip);
+
+            // area-aware sampling in annulus
+            float rr = std::sqrt(u01(rng) * (rOuter * rOuter - rInner * rInner) + rInner * rInner);
+            float a = uang(rng);
+
+            float x = rr * std::cos(a);
+            float z = rr * std::sin(a);
+
+            particles.push_back({x, y, z, type});
+            return;
         }
     };
 
-    for (int i = 0; i < nFluid; ++i) sampleInCylinder(0);
-    for (int i = 0; i < nCells; ++i) sampleInCylinder(1);
+    for (int i = 0; i < nFluid; ++i) sampleInShell(0);
+    for (int i = 0; i < nCells; ++i) sampleInShell(1);
 
     return particles;
 }
@@ -149,10 +175,50 @@ void updateSystem(
     chamber.suspended_cells = std::max(0.0f, chamber.suspended_cells);
 }
 
-void updateParticles(std::vector<Particle>& particles, float dt, float gForce, float flow) {
+void constrainToNestedCone(
+    Particle& p,
+    float height,
+    float outerBase,
+    float outerTip,
+    float innerBase,
+    float innerTip
+) {
+    float halfH = height * 0.5f;
+
+    if (p.y > halfH) p.y = -halfH;
+    if (p.y < -halfH) p.y =  halfH;
+
+    float r = std::sqrt(p.x * p.x + p.z * p.z) + 1e-6f;
+
+    float rOuter = outerRadiusAtY(p.y, height, outerBase, outerTip);
+    float rInner = innerRadiusAtY(p.y, height, innerBase, innerTip);
+
+    if (r > rOuter) {
+        float s = rOuter / r;
+        p.x *= s;
+        p.z *= s;
+    }
+
+    if (r < rInner) {
+        float s = rInner / r;
+        p.x *= s;
+        p.z *= s;
+    }
+}
+void updateParticles(
+    std::vector<Particle>& particles,
+    float dt,
+    float gForce,
+    float flow,
+    float height,
+    float outerBase,
+    float outerTip,
+    float innerBase,
+    float innerTip
+) {
     for (auto& p : particles) {
-        bool isCell = (p.type == 1);
-        float density = isCell ? 1.056f : 1.000f;
+        const bool isCell = (p.type == 1);
+        const float density = isCell ? 1.08f : 1.00f;
 
         float x = p.x;
         float y = p.y;
@@ -162,42 +228,85 @@ void updateParticles(std::vector<Particle>& particles, float dt, float gForce, f
         float rx = x / r;
         float rz = z / r;
 
-        // simplified centrifugal vs drag behavior
-        float radialPush = gForce * (density - 0.98f) * 0.02f;
-        float axial = flow * (isCell ? 0.7f : 1.0f);
+        float rOuter = outerRadiusAtY(y, height, outerBase, outerTip);
+        float rInner = innerRadiusAtY(y, height, innerBase, innerTip);
 
-        float swirl = 0.4f;
+        // gentler centrifugal separation
+        float radialPush = gForce * (density - 1.0f) * 0.018f;
+
+        // flow pushes fluid more than cells
+        float axial = flow * (isCell ? 0.30f : 0.55f);
+
+        // downward settling
+        float settling = isCell ? -0.035f : -0.015f;
+
+        // mild swirl
+        float swirl = 0.12f;
         float tx = -rz * swirl;
         float tz =  rx * swirl;
 
-        x += (radialPush * rx + tx) * dt;
-        z += (radialPush * rz + tz) * dt;
-        y += axial * dt;
+        // flow-aware equilibrium band
+        float flowEffect = std::clamp(flow * 0.0025f, 0.0f, 0.18f);
+        float targetFrac = isCell ? (0.82f - flowEffect) : (0.42f - 0.35f * flowEffect);
+        float targetR = rInner + targetFrac * (rOuter - rInner);
 
-        float maxR = 1.0f;
-        float newR = std::sqrt(x * x + z * z);
-        if (newR > maxR) {
-            float s = maxR / newR;
+        // softer pull toward band
+        float bandCorrection = (targetR - r) * (isCell ? 0.55f : 0.22f);
+
+        // decompose motion
+        float radialStepX = (radialPush * rx + bandCorrection * rx) * dt;
+        float radialStepZ = (radialPush * rz + bandCorrection * rz) * dt;
+
+        float swirlStepX = tx * dt;
+        float swirlStepZ = tz * dt;
+
+        float axialStep = (axial + settling) * dt;
+
+        // realistic drag / damping
+        float radialDrag = isCell ? 0.88f : 0.93f;
+        float swirlDrag  = isCell ? 0.80f : 0.88f;
+        float axialDrag  = isCell ? 0.90f : 0.95f;
+
+        radialStepX *= radialDrag;
+        radialStepZ *= radialDrag;
+
+        swirlStepX *= swirlDrag;
+        swirlStepZ *= swirlDrag;
+
+        axialStep *= axialDrag;
+
+        x += radialStepX + swirlStepX;
+        z += radialStepZ + swirlStepZ;
+        y += axialStep;
+
+        // vertical wrap
+        float halfH = height * 0.5f;
+        if (y > halfH) y = -halfH;
+        if (y < -halfH) y =  halfH;
+
+        // recompute bounds at new y
+        rOuter = outerRadiusAtY(y, height, outerBase, outerTip);
+        rInner = innerRadiusAtY(y, height, innerBase, innerTip);
+
+        float newR = std::sqrt(x * x + z * z) + 1e-6f;
+
+        // clamp to outer wall
+        if (newR > rOuter) {
+            float s = rOuter / newR;
+            x *= s;
+            z *= s;
+            newR = rOuter;
+        }
+
+        // clamp to inner wall
+        if (newR < rInner) {
+            float s = rInner / newR;
             x *= s;
             z *= s;
         }
-
-        float halfH = 1.0f;
-        if (y > halfH) y = -halfH;
-        if (y < -halfH) y =  halfH;
 
         p.x = x;
         p.y = y;
         p.z = z;
     }
-}
-
-void processInput(GLFWwindow* window, float& gForce, float& flow) {
-    if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS)    gForce += 0.05f;
-    if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS)  gForce -= 0.05f;
-    if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS) flow += 0.01f;
-    if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS)  flow -= 0.01f;
-
-    if (gForce < 0.0f) gForce = 0.0f;
-    if (flow < 0.0f) flow = 0.0f;
 }

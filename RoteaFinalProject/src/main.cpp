@@ -30,13 +30,23 @@ int main() {
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    const float chamberRadius = 1.0f;
-    const float chamberHeight = 2.0f;
+    const float chamberHeight = 2.5f;
+
+    const float outerBase = 1.15f;
+    const float outerTip  = 0.28f;
+
+    const float innerBase = 0.55f;
+    const float innerTip  = 0.12f;
+
     const float dt = 0.016f;
 
-    std::vector<Particle> particles = initParticles(15000, 1500, chamberRadius, chamberHeight);
+    std::vector<Particle> particles = initParticles(
+        15000, 1500,
+        chamberHeight,
+        outerBase, outerTip,
+        innerBase, innerTip
+    );
 
-    // Bags: Sample, Buffer, Product, Waste
     std::vector<Bag> bags = {
         {"Sample",  500.0f, 0.0f},
         {"Buffer",  500.0f, 0.0f},
@@ -44,21 +54,18 @@ int main() {
         {"Waste",     0.0f, 0.0f}
     };
 
-    // Chamber state
     Chamber chamber{0.0f, 0.0f};
 
-    // Line routing: -1 means chamber
     std::vector<Line> lines(8);
-    lines[0] = {LineID::A,  0, -1, 0.0f, true}; // Sample -> Chamber
-    lines[1] = {LineID::B,  1, -1, 0.0f, true}; // Buffer -> Chamber
-    lines[2] = {LineID::C, -1,  2, 0.0f, true}; // Chamber -> Product
-    lines[3] = {LineID::D, -1,  3, 0.0f, true}; // Chamber -> Waste
-    lines[4] = {LineID::E, -1,  2, 0.0f, true}; // Chamber -> Product alt
-    lines[5] = {LineID::F, -1,  3, 0.0f, true}; // Chamber -> Waste alt
-    lines[6] = {LineID::G,  2, -1, 0.0f, true}; // Product/intermediate -> Chamber
-    lines[7] = {LineID::H, -1,  2, 0.0f, true}; // Chamber -> Product alt
+    lines[0] = {LineID::A,  0, -1, 0.0f, true};
+    lines[1] = {LineID::B,  1, -1, 0.0f, true};
+    lines[2] = {LineID::C, -1,  2, 0.0f, true};
+    lines[3] = {LineID::D, -1,  3, 0.0f, true};
+    lines[4] = {LineID::E, -1,  2, 0.0f, true};
+    lines[5] = {LineID::F, -1,  3, 0.0f, true};
+    lines[6] = {LineID::G,  2, -1, 0.0f, true};
+    lines[7] = {LineID::H, -1,  2, 0.0f, true};
 
-    // Simple protocol
     std::vector<Step> protocol = {
         {
             "Load",
@@ -109,7 +116,15 @@ int main() {
             }
         }
 
-        updateParticles(particles, dt, step.g_force, chamberFlow);
+        updateParticles(
+            particles,
+            dt,
+            step.g_force,
+            chamberFlow,
+            chamberHeight,
+            outerBase, outerTip,
+            innerBase, innerTip
+        );
 
         stepTimer += dt;
         if (stepTimer >= step.duration_s) {
@@ -128,9 +143,12 @@ int main() {
         glRotatef(20.0f, 1.0f, 0.0f, 0.0f);
         glRotatef((float)glfwGetTime() * 10.0f, 0.0f, 1.0f, 0.0f);
 
-        drawConeChamber(0.95f, 0.25f, 2.0f);
+        drawNestedConeChamber(
+            outerBase, outerTip,
+            innerBase, innerTip,
+            chamberHeight
+        );
         drawParticles(particles);
-        drawKitOverlay(bags, lines);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
