@@ -2,19 +2,18 @@
 #include <random>
 #include <cmath>
 #include <algorithm>
-#include <GLFW/glfw3.h>
 
 #include "sim_cpu.h"
 #include "types.h"
 
 namespace {
     constexpr int CHAMBER_NODE = -1;
+    constexpr float PI_F = 3.14159265358979323846f;
 
     float clampf(float v, float lo, float hi) {
         return std::max(lo, std::min(v, hi));
     }
 }
-
 
 static float outerRadiusAtY(float y, float height, float outerBase, float outerTip) {
     float t = (y + height * 0.5f) / height;
@@ -41,29 +40,44 @@ std::vector<Particle> initParticles(
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> uy(-height * 0.5f, height * 0.5f);
     std::uniform_real_distribution<float> u01(0.0f, 1.0f);
-    std::uniform_real_distribution<float> uang(0.0f, 2.0f * 3.14159265f);
+    std::uniform_real_distribution<float> uang(0.0f, 2.0f * PI_F);
 
     auto sampleInShell = [&](int type) {
-        while (true) {
-            float y = uy(rng);
+        float y = uy(rng);
 
-            float rOuter = outerRadiusAtY(y, height, outerBase, outerTip);
-            float rInner = innerRadiusAtY(y, height, innerBase, innerTip);
+        float rOuter = outerRadiusAtY(y, height, outerBase, outerTip);
+        float rInner = innerRadiusAtY(y, height, innerBase, innerTip);
 
-            // area-aware sampling in annulus
-            float rr = std::sqrt(u01(rng) * (rOuter * rOuter - rInner * rInner) + rInner * rInner);
-            float a = uang(rng);
+        // area-aware annulus sampling
+        float rr = std::sqrt(u01(rng) * (rOuter * rOuter - rInner * rInner) + rInner * rInner);
+        float a = uang(rng);
 
-            float x = rr * std::cos(a);
-            float z = rr * std::sin(a);
+        Particle p{};
+        p.x = rr * std::cos(a);
+        p.y = y;
+        p.z = rr * std::sin(a);
 
-            particles.push_back({x, y, z, type});
-            return;
+        p.vx = 0.0f;
+        p.vy = 0.0f;
+        p.vz = 0.0f;
+
+        p.type = type;
+
+        if (type == 1) {
+            // cells
+            p.diameter = 0.12f;
+            p.density  = 1.08f;
+        } else {
+            // fluid tracer / background particles
+            p.diameter = 0.06f;
+            p.density  = 1.00f;
         }
+
+        particles.push_back(p);
     };
 
     for (int i = 0; i < nFluid; ++i) sampleInShell(0);
-    for (int i = 0; i < nCells; ++i) sampleInShell(1);
+    for (int i = 0; i < nCells;  ++i) sampleInShell(1);
 
     return particles;
 }
@@ -77,7 +91,11 @@ void updateSystem(
 ) {
     const float dt_min = dt / 60.0f;
 
-    // Track only chamber-relevant flow for drag model
+    // Keep chamber physical properties sane.
+    if (chamber.media_density <= 0.0f)   chamber.media_density = 1.00f;
+    if (chamber.media_viscosity <= 0.0f) chamber.media_viscosity = 1.00f;
+    chamber.omega = 0.06f * step.g_force;
+
     float chamberFlow_ml_min = 0.0f;
 
     for (int i = 0; i < 8; ++i) {
@@ -96,7 +114,6 @@ void updateSystem(
         if (!sourceIsChamber) srcPressure = bags[line.sourceBag].pressure_kpa;
         if (!targetIsChamber) dstPressure = bags[line.targetBag].pressure_kpa;
 
-        // Apply pressure BEFORE computing transferred volume
         float dP = srcPressure - dstPressure;
         float effectiveFlow = commandedFlow * clampf(1.0f + 0.01f * dP, 0.25f, 2.0f);
 
@@ -106,27 +123,24 @@ void updateSystem(
         if (!sourceIsChamber && targetIsChamber) {
             Bag& src = bags[line.sourceBag];
 
-            if (src.volume_ml < volumeTransfer)
+            if (src.volume_ml < volumeTransfer) {
                 volumeTransfer = src.volume_ml;
+            }
 
             src.volume_ml -= volumeTransfer;
 
-            // very simple chamber loading model
-            chamber.suspended_cells += volumeTransfer * 0.1f;
+            // simple loading model
+            chamber.suspended_cells += volumeTransfer * 0.10f;
             chamberFlow_ml_min += effectiveFlow;
         }
-
         // CHAMBER -> BAG
         else if (sourceIsChamber && !targetIsChamber) {
             Bag& dst = bags[line.targetBag];
-
             dst.volume_ml += volumeTransfer;
 
-            // remove suspended cells first, then retained cells if harvest-like conditions
             float suspendedOut = std::min(chamber.suspended_cells, volumeTransfer * 0.08f);
             chamber.suspended_cells -= suspendedOut;
 
-            // during lower g-force or harvest-like output, allow retained cells to leave too
             if (step.phase == PhaseType::Harvest) {
                 float retainedOut = std::min(chamber.retained_cells, volumeTransfer * 0.15f);
                 chamber.retained_cells -= retainedOut;
@@ -134,44 +148,40 @@ void updateSystem(
 
             chamberFlow_ml_min += effectiveFlow;
         }
-
         // BAG -> BAG
         else if (!sourceIsChamber && !targetIsChamber) {
             Bag& src = bags[line.sourceBag];
             Bag& dst = bags[line.targetBag];
 
-            if (src.volume_ml < volumeTransfer)
+            if (src.volume_ml < volumeTransfer) {
                 volumeTransfer = src.volume_ml;
+            }
 
             src.volume_ml -= volumeTransfer;
             dst.volume_ml += volumeTransfer;
         }
-
-        // CHAMBER -> CHAMBER is nonsense, ignore it
+        // CHAMBER -> CHAMBER ignored
     }
 
-    // === CHAMBER PHYSICS ===
-    // Manual model: opposing centrifugation and drag forces govern particle behavior.
-    // We keep this simplified but make it depend only on chamber-relevant flow. :contentReference[oaicite:5]{index=5}
+    // Coarse chamber-level retention model.
+    // This remains simplified, but now at least tracks the chamber's rotational state.
     float F_c = step.g_force;
     float F_d = 0.05f * chamberFlow_ml_min;
     float net = F_c - F_d;
 
     if (net > 0.0f) {
-        // retention / bed formation
         float retainFrac = clampf(0.02f + 0.00005f * net, 0.0f, 0.25f);
         float retain = chamber.suspended_cells * retainFrac;
         chamber.retained_cells += retain;
         chamber.suspended_cells -= retain;
     } else {
-        // washout / elutriation
         float washFrac = clampf(0.02f + 0.00005f * (-net), 0.0f, 0.25f);
         float loss = chamber.retained_cells * washFrac;
         chamber.retained_cells -= loss;
-        chamber.suspended_cells += loss * 0.25f; // some re-entrainment
+        chamber.suspended_cells += loss * 0.25f;
     }
 
-    chamber.retained_cells = std::max(0.0f, chamber.retained_cells);
+    chamber.retained_cells  = std::max(0.0f, chamber.retained_cells);
     chamber.suspended_cells = std::max(0.0f, chamber.suspended_cells);
 }
 
@@ -183,12 +193,13 @@ void constrainToNestedCone(
     float innerBase,
     float innerTip
 ) {
-    float halfH = height * 0.5f;
+    const float eps = 1e-6f;
+    const float halfH = height * 0.5f;
 
-    if (p.y > halfH) p.y = -halfH;
+    if (p.y > halfH)  p.y = -halfH;
     if (p.y < -halfH) p.y =  halfH;
 
-    float r = std::sqrt(p.x * p.x + p.z * p.z) + 1e-6f;
+    float r = std::sqrt(p.x * p.x + p.z * p.z) + eps;
 
     float rOuter = outerRadiusAtY(p.y, height, outerBase, outerTip);
     float rInner = innerRadiusAtY(p.y, height, innerBase, innerTip);
@@ -197,14 +208,20 @@ void constrainToNestedCone(
         float s = rOuter / r;
         p.x *= s;
         p.z *= s;
+        p.vx *= 0.65f;
+        p.vz *= 0.65f;
     }
 
+    r = std::sqrt(p.x * p.x + p.z * p.z) + eps;
     if (r < rInner) {
         float s = rInner / r;
         p.x *= s;
         p.z *= s;
+        p.vx *= 0.65f;
+        p.vz *= 0.65f;
     }
 }
+
 void updateParticles(
     std::vector<Particle>& particles,
     float dt,
@@ -216,97 +233,178 @@ void updateParticles(
     float innerBase,
     float innerTip
 ) {
+    const float eps = 1e-6f;
+    const float halfH = height * 0.5f;
+
+    // These are local defaults for now.
+    // Later you can route chamber.media_density / chamber.media_viscosity here directly.
+    const float mediaDensity   = 1.00f;
+    const float mediaViscosity = 1.00f;
+
+    // Control knob -> approximate rotational strength
+    const float omega = 0.06f * gForce;
+
+    // Tip-driven inlet jet tuning
+    const float jetRadius   = 0.18f;
+    const float jetStrength = 0.020f * flow;
+    const float jetDecay    = 8.0f;
+
+    // Recirculation and rotational swirl
+    const float wallReturnStrength = 0.35f;
+    const float swirlStrength      = 0.08f;
+
+    // Global damping
+    const float velDamping = 0.965f;
+
+    // Choose which end of the chamber acts like the inner cone tip.
+    // Flip this sign if your rendered chamber is oriented the other way.
+    const float tipY = -halfH;
+
     for (auto& p : particles) {
-        const bool isCell = (p.type == 1);
-        const float density = isCell ? 1.08f : 1.00f;
+        float x  = p.x;
+        float y  = p.y;
+        float z  = p.z;
+        float vx = p.vx;
+        float vy = p.vy;
+        float vz = p.vz;
 
-        float x = p.x;
-        float y = p.y;
-        float z = p.z;
-
-        float r = std::sqrt(x * x + z * z) + 1e-6f;
+        float r = std::sqrt(x * x + z * z) + eps;
         float rx = x / r;
         float rz = z / r;
 
         float rOuter = outerRadiusAtY(y, height, outerBase, outerTip);
         float rInner = innerRadiusAtY(y, height, innerBase, innerTip);
 
-        // gentler centrifugal separation
-        float radialPush = gForce * (density - 1.0f) * 0.018f;
+        // -----------------------------
+        // 1. Tip-driven jet from inner-cone tip
+        // -----------------------------
+        float dyTip = y - tipY;
+        float distToTip = std::sqrt(r * r + dyTip * dyTip) + eps;
 
-        // flow pushes fluid more than cells
-        float axial = flow * (isCell ? 0.30f : 0.55f);
+        // Localized nozzle weighting: strongest near axis around the tip
+        float radialNozzleWeight = std::exp(-(r * r) / std::max(jetRadius * jetRadius, eps));
+        float jetFalloff = std::exp(-jetDecay * distToTip) * radialNozzleWeight;
 
-        // downward settling
-        float settling = isCell ? -0.035f : -0.015f;
+        // Flow leaves tip and expands outward into chamber
+        float jetDirX = rx;
+        float jetDirY = dyTip / distToTip;
+        float jetDirZ = rz;
 
-        // mild swirl
-        float swirl = 0.12f;
-        float tx = -rz * swirl;
-        float tz =  rx * swirl;
+        float vJetX = jetStrength * jetFalloff * jetDirX;
+        float vJetY = jetStrength * jetFalloff * jetDirY;
+        float vJetZ = jetStrength * jetFalloff * jetDirZ;
 
-        // flow-aware equilibrium band
-        float flowEffect = std::clamp(flow * 0.0025f, 0.0f, 0.18f);
-        float targetFrac = isCell ? (0.82f - flowEffect) : (0.42f - 0.35f * flowEffect);
-        float targetR = rInner + targetFrac * (rOuter - rInner);
+        // -----------------------------
+        // 2. Wall-following return flow
+        // -----------------------------
+        float gap = std::max(rOuter - rInner, eps);
+        float wallFrac = (r - rInner) / gap; // 0 near inner wall, 1 near outer wall
+        wallFrac = clampf(wallFrac, 0.0f, 1.0f);
 
-        // softer pull toward band
-        float bandCorrection = (targetR - r) * (isCell ? 0.55f : 0.22f);
+        float nearOuter = clampf((wallFrac - 0.65f) / 0.35f, 0.0f, 1.0f);
 
-        // decompose motion
-        float radialStepX = (radialPush * rx + bandCorrection * rx) * dt;
-        float radialStepZ = (radialPush * rz + bandCorrection * rz) * dt;
+        // Return flow trends back toward tip along outer wall region
+        float vReturnY = -wallReturnStrength * flow * 0.0025f * nearOuter;
+        float vReturnX = -rx * wallReturnStrength * flow * 0.0015f * nearOuter;
+        float vReturnZ = -rz * wallReturnStrength * flow * 0.0015f * nearOuter;
 
-        float swirlStepX = tx * dt;
-        float swirlStepZ = tz * dt;
+        // -----------------------------
+        // 3. Rotational swirl
+        // -----------------------------
+        float vSwirlX = -rz * swirlStrength * omega;
+        float vSwirlY =  0.0f;
+        float vSwirlZ =  rx * swirlStrength * omega;
 
-        float axialStep = (axial + settling) * dt;
+        // Total local flow field
+        float flowVX = vJetX + vReturnX + vSwirlX;
+        float flowVY = vJetY + vReturnY + vSwirlY;
+        float flowVZ = vJetZ + vReturnZ + vSwirlZ;
 
-        // realistic drag / damping
-        float radialDrag = isCell ? 0.88f : 0.93f;
-        float swirlDrag  = isCell ? 0.80f : 0.88f;
-        float axialDrag  = isCell ? 0.90f : 0.95f;
+        // -----------------------------
+        // 4. Stokes-like drag toward local fluid velocity
+        // -----------------------------
+        float relVX = flowVX - vx;
+        float relVY = flowVY - vy;
+        float relVZ = flowVZ - vz;
 
-        radialStepX *= radialDrag;
-        radialStepZ *= radialDrag;
+        float d = std::max(p.diameter, 0.02f);
+        float dragCoeff = 3.0f * PI_F * mediaViscosity * d;
 
-        swirlStepX *= swirlDrag;
-        swirlStepZ *= swirlDrag;
+        float axDrag = dragCoeff * relVX;
+        float ayDrag = dragCoeff * relVY;
+        float azDrag = dragCoeff * relVZ;
 
-        axialStep *= axialDrag;
+        // -----------------------------
+        // 5. Centrifugal outward tendency
+        // -----------------------------
+        float densityDelta = std::max(p.density - mediaDensity, 0.0f);
 
-        x += radialStepX + swirlStepX;
-        z += radialStepZ + swirlStepZ;
-        y += axialStep;
+        float aCent =
+            densityDelta *
+            PI_F *
+            d * d * d *
+            omega * omega *
+            r / 6.0f;
 
-        // vertical wrap
-        float halfH = height * 0.5f;
-        if (y > halfH) y = -halfH;
+        float axCent = rx * aCent;
+        float ayCent = 0.0f;
+        float azCent = rz * aCent;
+
+        // -----------------------------
+        // 6. Integrate
+        // -----------------------------
+        float ax = axDrag + axCent;
+        float ay = ayDrag;
+        float az = azDrag + azCent;
+
+        vx += ax * dt;
+        vy += ay * dt;
+        vz += az * dt;
+
+        vx *= velDamping;
+        vy *= velDamping;
+        vz *= velDamping;
+
+        x += vx * dt;
+        y += vy * dt;
+        z += vz * dt;
+
+        // -----------------------------
+        // 7. Vertical wrap
+        // -----------------------------
+        if (y > halfH)  y = -halfH;
         if (y < -halfH) y =  halfH;
 
-        // recompute bounds at new y
+        // -----------------------------
+        // 8. Recompute local cone bounds and clamp
+        // -----------------------------
         rOuter = outerRadiusAtY(y, height, outerBase, outerTip);
         rInner = innerRadiusAtY(y, height, innerBase, innerTip);
 
-        float newR = std::sqrt(x * x + z * z) + 1e-6f;
+        float newR = std::sqrt(x * x + z * z) + eps;
 
-        // clamp to outer wall
         if (newR > rOuter) {
             float s = rOuter / newR;
             x *= s;
             z *= s;
+            vx *= 0.65f;
+            vz *= 0.65f;
             newR = rOuter;
         }
 
-        // clamp to inner wall
         if (newR < rInner) {
             float s = rInner / newR;
             x *= s;
             z *= s;
+            vx *= 0.65f;
+            vz *= 0.65f;
         }
 
-        p.x = x;
-        p.y = y;
-        p.z = z;
+        p.x  = x;
+        p.y  = y;
+        p.z  = z;
+        p.vx = vx;
+        p.vy = vy;
+        p.vz = vz;
     }
 }

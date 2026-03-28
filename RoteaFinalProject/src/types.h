@@ -13,6 +13,11 @@ enum class PhaseType {
 
 struct Particle {
     float x, y, z;
+    float vx, vy, vz;
+
+    float diameter;
+    float density;
+
     int type;
 };
 
@@ -33,6 +38,10 @@ struct Line {
 struct Chamber {
     float retained_cells;
     float suspended_cells;
+
+    float media_density;
+    float media_viscosity;
+    float omega;
 };
 
 struct Step {

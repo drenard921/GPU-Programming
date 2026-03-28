@@ -2,11 +2,18 @@
 #include <vector>
 
 #include <GLFW/glfw3.h>
+
+#ifdef __APPLE__
+#include <OpenGL/gl.h>
+#else
 #include <GL/gl.h>
+#endif
 
 #include "renderer.h"
 #include "sim_cpu.h"
 #include "types.h"
+
+static constexpr int CHAMBER_NODE = -1;
 
 static void glfw_error_callback(int error, const char* description) {
     std::cerr << "GLFW Error [" << error << "]: " << description << std::endl;
@@ -54,46 +61,62 @@ int main() {
         {"Waste",     0.0f, 0.0f}
     };
 
-    Chamber chamber{0.0f, 0.0f};
+    Chamber chamber{
+        0.0f,  // retained_cells
+        0.0f,  // suspended_cells
+        1.00f, // media_density
+        1.00f, // media_viscosity
+        0.0f   // omega
+    };
 
     std::vector<Line> lines(8);
-    lines[0] = {LineID::A,  0, -1, 0.0f, true};
-    lines[1] = {LineID::B,  1, -1, 0.0f, true};
-    lines[2] = {LineID::C, -1,  2, 0.0f, true};
-    lines[3] = {LineID::D, -1,  3, 0.0f, true};
-    lines[4] = {LineID::E, -1,  2, 0.0f, true};
-    lines[5] = {LineID::F, -1,  3, 0.0f, true};
-    lines[6] = {LineID::G,  2, -1, 0.0f, true};
-    lines[7] = {LineID::H, -1,  2, 0.0f, true};
+    lines[0] = {LineID::A, 0,            CHAMBER_NODE, 0.0f, true};
+    lines[1] = {LineID::B, 1,            CHAMBER_NODE, 0.0f, true};
+    lines[2] = {LineID::C, CHAMBER_NODE, 2,            0.0f, true};
+    lines[3] = {LineID::D, CHAMBER_NODE, 3,            0.0f, true};
+    lines[4] = {LineID::E, CHAMBER_NODE, 2,            0.0f, true};
+    lines[5] = {LineID::F, CHAMBER_NODE, 3,            0.0f, true};
+    lines[6] = {LineID::G, 2,            CHAMBER_NODE, 0.0f, true};
+    lines[7] = {LineID::H, CHAMBER_NODE, 2,            0.0f, true};
+
+    // std::vector<Step> protocol = {
+    //     {
+    //         "Bed Stabilize",
+    //         PhaseType::Concentrate,
+    //         100.0f,
+    //         3000.0f,
+    //         {0.0f, 12.0f, 0.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f}
+    //     }
+    // };
 
     std::vector<Step> protocol = {
         {
             "Load",
             PhaseType::Load,
-            5.0f,
-            500.0f,
-            {50.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}
+            8.0f,
+            1200.0f,
+            {20.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}
+            },
+        {
+            "Bed Stabilize",
+            PhaseType::Concentrate,
+            15.0f,
+            3000.0f,
+            {0.0f, 12.0f, 0.0f, 6.0f, 0.0f, 0.0f, 0.0f, 0.0f}
         },
         {
             "Wash",
             PhaseType::Wash,
-            5.0f,
-            800.0f,
-            {0.0f, 50.0f, 0.0f, 50.0f, 0.0f, 0.0f, 0.0f, 0.0f}
-        },
-        {
-            "Concentrate",
-            PhaseType::Concentrate,
-            5.0f,
-            1200.0f,
-            {0.0f, 10.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}
+            12.0f,
+            2600.0f,
+            {0.0f, 15.0f, 0.0f, 8.0f, 0.0f, 0.0f, 0.0f, 0.0f}
         },
         {
             "Harvest",
             PhaseType::Harvest,
-            5.0f,
-            300.0f,
-            {0.0f, 0.0f, 50.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}
+            10.0f,
+            800.0f,
+            {0.0f, 0.0f, 18.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}
         }
     };
 
@@ -111,8 +134,8 @@ int main() {
         float chamberFlow = 0.0f;
         for (const auto& line : lines) {
             if (!line.active) continue;
-            if (line.sourceBag == -1 || line.targetBag == -1) {
-                chamberFlow += step.flow_ml_min[(int)line.id];
+            if (line.sourceBag == CHAMBER_NODE || line.targetBag == CHAMBER_NODE) {
+                chamberFlow += step.flow_ml_min[static_cast<int>(line.id)];
             }
         }
 
@@ -128,8 +151,15 @@ int main() {
 
         stepTimer += dt;
         if (stepTimer >= step.duration_s) {
+            std::cout
+                << "Phase complete: " << step.name
+                << " | retained=" << chamber.retained_cells
+                << " | suspended=" << chamber.suspended_cells
+                << " | omega=" << chamber.omega
+                << std::endl;
+
             stepTimer = 0.0f;
-            currentStep = (currentStep + 1) % protocol.size();
+            currentStep = (currentStep + 1) % static_cast<int>(protocol.size());
         }
 
         glViewport(0, 0, width, height);
@@ -141,7 +171,7 @@ int main() {
         glLoadIdentity();
         glTranslatef(0.0f, 0.0f, -5.0f);
         glRotatef(20.0f, 1.0f, 0.0f, 0.0f);
-        glRotatef((float)glfwGetTime() * 10.0f, 0.0f, 1.0f, 0.0f);
+        glRotatef(static_cast<float>(glfwGetTime()) * 6.0f, 0.0f, 1.0f, 0.0f);
 
         drawNestedConeChamber(
             outerBase, outerTip,
