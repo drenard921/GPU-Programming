@@ -5,6 +5,70 @@
 #include <sstream>
 #include <vector>
 
+namespace {
+
+bool get_first_device_for_type(
+    cl_platform_id platform,
+    cl_device_type device_type,
+    cl_device_id& device_out
+) {
+    cl_uint num_devices = 0;
+    cl_int err = clGetDeviceIDs(
+        platform,
+        device_type,
+        0,
+        nullptr,
+        &num_devices
+    );
+
+    if (err != CL_SUCCESS || num_devices == 0) {
+        return false;
+    }
+
+    std::vector<cl_device_id> devices(num_devices);
+    err = clGetDeviceIDs(
+        platform,
+        device_type,
+        num_devices,
+        devices.data(),
+        nullptr
+    );
+
+    if (err != CL_SUCCESS || devices.empty()) {
+        return false;
+    }
+
+    device_out = devices[0];
+    return true;
+}
+
+void print_selected_device_info(cl_device_id device) {
+    if (device == nullptr) {
+        return;
+    }
+
+    char name[256] = {0};
+    char vendor[256] = {0};
+
+    if (clGetDeviceInfo(
+            device,
+            CL_DEVICE_NAME,
+            sizeof(name),
+            name,
+            nullptr) == CL_SUCCESS &&
+        clGetDeviceInfo(
+            device,
+            CL_DEVICE_VENDOR,
+            sizeof(vendor),
+            vendor,
+            nullptr) == CL_SUCCESS) {
+        std::cout << "OpenCL device: " << vendor
+                  << " - " << name << "\n";
+    }
+}
+
+}  // namespace
+
 bool check_opencl_error(
     cl_int err,
     const std::string& message
@@ -96,61 +160,23 @@ bool initialize_opencl(
     }
 
     cl_ctx.platform = platforms[0];
+    cl_ctx.device = nullptr;
 
-    cl_uint num_devices = 0;
-    err = clGetDeviceIDs(
-        cl_ctx.platform,
-        CL_DEVICE_TYPE_GPU,
-        0,
-        nullptr,
-        &num_devices
-    );
-
-    if (err != CL_SUCCESS || num_devices == 0) {
-        err = clGetDeviceIDs(
+    if (!get_first_device_for_type(
+            cl_ctx.platform,
+            CL_DEVICE_TYPE_GPU,
+            cl_ctx.device) &&
+        !get_first_device_for_type(
             cl_ctx.platform,
             CL_DEVICE_TYPE_DEFAULT,
-            0,
-            nullptr,
-            &num_devices
-        );
-        if (!check_opencl_error(
-                err,
-                "Failed to query OpenCL devices")) {
-            return false;
-        }
-    }
-
-    if (num_devices == 0) {
-        std::cerr << "No OpenCL devices found.\n";
+            cl_ctx.device) &&
+        !get_first_device_for_type(
+            cl_ctx.platform,
+            CL_DEVICE_TYPE_CPU,
+            cl_ctx.device)) {
+        std::cerr << "No usable OpenCL devices found.\n";
         return false;
     }
-
-    std::vector<cl_device_id> devices(num_devices);
-    err = clGetDeviceIDs(
-        cl_ctx.platform,
-        CL_DEVICE_TYPE_GPU,
-        num_devices,
-        devices.data(),
-        nullptr
-    );
-
-    if (err != CL_SUCCESS) {
-        err = clGetDeviceIDs(
-            cl_ctx.platform,
-            CL_DEVICE_TYPE_DEFAULT,
-            num_devices,
-            devices.data(),
-            nullptr
-        );
-        if (!check_opencl_error(
-                err,
-                "Failed to get OpenCL device IDs")) {
-            return false;
-        }
-    }
-
-    cl_ctx.device = devices[0];
 
     cl_ctx.context = clCreateContext(
         nullptr,
@@ -166,7 +192,11 @@ bool initialize_opencl(
     }
 
 #if CL_TARGET_OPENCL_VERSION >= 200
-    cl_queue_properties props[] = {0};
+    cl_queue_properties props[] = {
+        CL_QUEUE_PROPERTIES,
+        CL_QUEUE_PROFILING_ENABLE,
+        0
+    };
     cl_ctx.queue = clCreateCommandQueueWithProperties(
         cl_ctx.context,
         cl_ctx.device,
@@ -177,7 +207,7 @@ bool initialize_opencl(
     cl_ctx.queue = clCreateCommandQueue(
         cl_ctx.context,
         cl_ctx.device,
-        0,
+        CL_QUEUE_PROFILING_ENABLE,
         &err
     );
 #endif
@@ -227,6 +257,7 @@ bool initialize_opencl(
         return false;
     }
 
+    print_selected_device_info(cl_ctx.device);
     return true;
 }
 

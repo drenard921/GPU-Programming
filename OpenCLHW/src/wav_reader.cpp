@@ -28,10 +28,6 @@ bool matches_id(const char id[4], const char* expected) {
            id[3] == expected[3];
 }
 
-std::string chunk_id_to_string(const char id[4]) {
-    return std::string(id, id + 4);
-}
-
 }  // namespace
 
 bool read_wav_file(const std::string& path, WavData& out) {

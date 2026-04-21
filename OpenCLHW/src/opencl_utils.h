@@ -1,11 +1,10 @@
 #ifndef OPENCL_UTILS_H
 #define OPENCL_UTILS_H
+
 #define CL_TARGET_OPENCL_VERSION 120
 
 #include <CL/cl.h>
-
 #include <string>
-#include <vector>
 
 struct OpenCLContext {
     cl_platform_id platform = nullptr;
