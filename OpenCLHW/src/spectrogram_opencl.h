@@ -12,3 +12,10 @@ SpectrogramResult compute_spectrogram_opencl(
 );
 
 #endif
+
+std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
+    const std::vector<std::vector<float>>& batch_samples,
+    int window_size,
+    int hop_size,
+    int num_bins
+);

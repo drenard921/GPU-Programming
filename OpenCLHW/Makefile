@@ -23,14 +23,17 @@ SRCS := \
 OBJS := $(SRCS:.cpp=.o)
 
 # ===== Runtime Arguments =====
-INPUT  ?= $(DATA_DIR)/blues/blues.00000.wav
-MODE   ?= cpu
-WINDOW ?= 1024
-HOP    ?= 512
-BINS   ?= 512
+INPUT      ?= $(DATA_DIR)/blues/blues.00000.wav
+BATCH_DIR  ?= $(DATA_DIR)/blues
+MODE       ?= cpu
+WINDOW     ?= 1024
+HOP        ?= 512
+BINS       ?= 512
 
 # ===== Targets =====
-.PHONY: all build run run_cpu run_gpu batch clean rebuild help dirs
+.PHONY: all build run run_cpu run_gpu run_both \
+        batch_cpu batch_gpu batch_both \
+        clean rebuild help dirs
 
 all: build
 
@@ -46,6 +49,8 @@ $(TARGET): $(OBJS)
 $(SRC_DIR)/%.o: $(SRC_DIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+# ===== Single-file modes =====
+
 run: build
 	./$(TARGET) "$(INPUT)" "$(MODE)" "$(WINDOW)" "$(HOP)" "$(BINS)"
 
@@ -55,17 +60,20 @@ run_cpu: build
 run_gpu: build
 	./$(TARGET) "$(INPUT)" gpu "$(WINDOW)" "$(HOP)" "$(BINS)"
 
+run_both: build
+	./$(TARGET) "$(INPUT)" both "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+# ===== Directory batch modes =====
+# These assume main.cpp treats directory input as batch mode.
+
 batch_cpu: build
-	@find $(DATA_DIR) -name "*.wav" | while read file; do \
-		echo "CPU processing $$file"; \
-		./$(TARGET) "$$file" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"; \
-	done
+	./$(TARGET) "$(BATCH_DIR)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
 
 batch_gpu: build
-	@find $(DATA_DIR) -name "*.wav" | while read file; do \
-		echo "GPU processing $$file"; \
-		./$(TARGET) "$$file" gpu "$(WINDOW)" "$(HOP)" "$(BINS)"; \
-	done
+	./$(TARGET) "$(BATCH_DIR)" gpu "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+batch_both: build
+	./$(TARGET) "$(BATCH_DIR)" both "$(WINDOW)" "$(HOP)" "$(BINS)"
 
 clean:
 	rm -rf $(BIN_DIR) $(OUT_DIR) $(OBJS)
@@ -78,13 +86,16 @@ help:
 	@echo "  make run"
 	@echo "  make run_cpu"
 	@echo "  make run_gpu"
+	@echo "  make run_both"
 	@echo "  make batch_cpu"
 	@echo "  make batch_gpu"
+	@echo "  make batch_both"
 	@echo "  make clean"
 	@echo ""
 	@echo "Configurable variables:"
-	@echo "  INPUT=<wav path>"
-	@echo "  MODE=cpu|gpu"
+	@echo "  INPUT=<wav file path>"
+	@echo "  BATCH_DIR=<directory of wav files>"
+	@echo "  MODE=cpu|gpu|both"
 	@echo "  WINDOW=<window size>"
 	@echo "  HOP=<hop size>"
 	@echo "  BINS=<num bins>"
@@ -92,5 +103,7 @@ help:
 	@echo "Examples:"
 	@echo "  make run"
 	@echo "  make run MODE=gpu"
-	@echo "  make run INPUT=Data/genres_original/jazz/jazz.00000.wav MODE=gpu"
+	@echo "  make run INPUT=Data/genres_original/jazz/jazz.00000.wav MODE=both"
+	@echo "  make batch_gpu"
+	@echo "  make batch_both BATCH_DIR=Data/genres_original/blues"
 	@echo "  make run WINDOW=2048 HOP=256 BINS=1024"
