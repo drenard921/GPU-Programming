@@ -16,14 +16,25 @@ struct BatchItemInfo {
     size_t byte_size = 0;
 };
 
+struct BatchRunResources {
+    cl_mem samples_buffer = nullptr;
+    cl_mem windowed_frames_buffer = nullptr;
+    cl_mem output_subbuffer = nullptr;
+    cl_event window_event = nullptr;
+    cl_event dft_event = nullptr;
+    cl_event read_event = nullptr;
+};
+
 size_t round_up(size_t value, size_t multiple) {
     if (multiple == 0) {
         return value;
     }
-    size_t remainder = value % multiple;
+
+    const size_t remainder = value % multiple;
     if (remainder == 0) {
         return value;
     }
+
     return value + multiple - remainder;
 }
 
@@ -80,7 +91,7 @@ void print_event_time_ms(
     cl_ulong start = 0;
     cl_ulong end = 0;
 
-    cl_int err1 = clGetEventProfilingInfo(
+    const cl_int err1 = clGetEventProfilingInfo(
         event,
         CL_PROFILING_COMMAND_START,
         sizeof(cl_ulong),
@@ -88,7 +99,7 @@ void print_event_time_ms(
         nullptr
     );
 
-    cl_int err2 = clGetEventProfilingInfo(
+    const cl_int err2 = clGetEventProfilingInfo(
         event,
         CL_PROFILING_COMMAND_END,
         sizeof(cl_ulong),
@@ -97,7 +108,7 @@ void print_event_time_ms(
     );
 
     if (err1 == CL_SUCCESS && err2 == CL_SUCCESS && end >= start) {
-        double ms = static_cast<double>(end - start) / 1.0e6;
+        const double ms = static_cast<double>(end - start) / 1.0e6;
         std::cout << label << ": " << ms << " ms\n";
     }
 }
@@ -159,7 +170,8 @@ SpectrogramResult compute_spectrogram_opencl(
     cl_mem windowed_frames_buffer = clCreateBuffer(
         cl_ctx.context,
         CL_MEM_READ_WRITE,
-        sizeof(float) * result.num_frames * window_size,
+        sizeof(float) * static_cast<size_t>(result.num_frames) *
+            static_cast<size_t>(window_size),
         nullptr,
         &err
     );
@@ -185,7 +197,7 @@ SpectrogramResult compute_spectrogram_opencl(
         return {};
     }
 
-    err  = clSetKernelArg(window_kernel, 0, sizeof(cl_mem), &samples_buffer);
+    err = clSetKernelArg(window_kernel, 0, sizeof(cl_mem), &samples_buffer);
     err |= clSetKernelArg(
         window_kernel,
         1,
@@ -206,7 +218,7 @@ SpectrogramResult compute_spectrogram_opencl(
         return {};
     }
 
-    err  = clSetKernelArg(
+    err = clSetKernelArg(
         dft_kernel,
         0,
         sizeof(cl_mem),
@@ -349,6 +361,7 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
 
     results.resize(batch_samples.size());
     std::vector<BatchItemInfo> infos(batch_samples.size());
+    std::vector<BatchRunResources> resources(batch_samples.size());
 
     size_t total_output_bytes = 0;
 
@@ -406,13 +419,14 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
     const size_t window_local[2] = {1, 64};
     const size_t dft_local[2] = {1, 16};
 
-    double total_window_kernel_ms = 0.0;
-    double total_dft_kernel_ms = 0.0;
+    bool enqueue_failed = false;
 
+    // First pass: enqueue all compute work for the batch.
     for (size_t i = 0; i < batch_samples.size(); ++i) {
         const auto& samples = batch_samples[i];
         const auto& info = infos[i];
         auto& result = results[i];
+        auto& res = resources[i];
 
         if (result.values.empty()) {
             continue;
@@ -420,7 +434,7 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
 
         const int num_samples = static_cast<int>(samples.size());
 
-        cl_mem samples_buffer = clCreateBuffer(
+        res.samples_buffer = clCreateBuffer(
             cl_ctx.context,
             CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             sizeof(float) * samples.size(),
@@ -428,28 +442,30 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
             &err
         );
         if (!check_opencl_error(err, "Failed to create batch samples buffer")) {
-            continue;
+            enqueue_failed = true;
+            break;
         }
 
-        cl_mem windowed_frames_buffer = clCreateBuffer(
+        res.windowed_frames_buffer = clCreateBuffer(
             cl_ctx.context,
             CL_MEM_READ_WRITE,
-            sizeof(float) * result.num_frames * window_size,
+            sizeof(float) * static_cast<size_t>(result.num_frames) *
+                static_cast<size_t>(window_size),
             nullptr,
             &err
         );
         if (!check_opencl_error(
                 err,
                 "Failed to create batch windowed frames buffer")) {
-            clReleaseMemObject(samples_buffer);
-            continue;
+            enqueue_failed = true;
+            break;
         }
 
         cl_buffer_region region{};
         region.origin = info.byte_offset;
         region.size = info.byte_size;
 
-        cl_mem output_subbuffer = clCreateSubBuffer(
+        res.output_subbuffer = clCreateSubBuffer(
             parent_output_buffer,
             CL_MEM_WRITE_ONLY,
             CL_BUFFER_CREATE_TYPE_REGION,
@@ -457,39 +473,41 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
             &err
         );
         if (!check_opencl_error(err, "Failed to create output sub-buffer")) {
-            clReleaseMemObject(windowed_frames_buffer);
-            clReleaseMemObject(samples_buffer);
-            continue;
+            enqueue_failed = true;
+            break;
         }
 
-        err  = clSetKernelArg(window_kernel, 0, sizeof(cl_mem), &samples_buffer);
+        err = clSetKernelArg(window_kernel, 0, sizeof(cl_mem), &res.samples_buffer);
         err |= clSetKernelArg(
             window_kernel,
             1,
             sizeof(cl_mem),
-            &windowed_frames_buffer
+            &res.windowed_frames_buffer
         );
         err |= clSetKernelArg(window_kernel, 2, sizeof(int), &num_samples);
         err |= clSetKernelArg(window_kernel, 3, sizeof(int), &window_size);
         err |= clSetKernelArg(window_kernel, 4, sizeof(int), &hop_size);
-        err |= clSetKernelArg(window_kernel, 5, sizeof(int), &result.num_frames);
+        err |= clSetKernelArg(
+            window_kernel,
+            5,
+            sizeof(int),
+            &result.num_frames
+        );
 
         if (!check_opencl_error(
                 err,
                 "Failed to set batch window kernel arguments")) {
-            clReleaseMemObject(output_subbuffer);
-            clReleaseMemObject(windowed_frames_buffer);
-            clReleaseMemObject(samples_buffer);
-            continue;
+            enqueue_failed = true;
+            break;
         }
 
-        err  = clSetKernelArg(
+        err = clSetKernelArg(
             dft_kernel,
             0,
             sizeof(cl_mem),
-            &windowed_frames_buffer
+            &res.windowed_frames_buffer
         );
-        err |= clSetKernelArg(dft_kernel, 1, sizeof(cl_mem), &output_subbuffer);
+        err |= clSetKernelArg(dft_kernel, 1, sizeof(cl_mem), &res.output_subbuffer);
         err |= clSetKernelArg(
             dft_kernel,
             2,
@@ -503,10 +521,8 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
         if (!check_opencl_error(
                 err,
                 "Failed to set batch DFT kernel arguments")) {
-            clReleaseMemObject(output_subbuffer);
-            clReleaseMemObject(windowed_frames_buffer);
-            clReleaseMemObject(samples_buffer);
-            continue;
+            enqueue_failed = true;
+            break;
         }
 
         const size_t window_global[2] = {
@@ -519,9 +535,6 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
             round_up(static_cast<size_t>(num_bins), dft_local[1])
         };
 
-        cl_event window_event = nullptr;
-        cl_event dft_event = nullptr;
-
         err = clEnqueueNDRangeKernel(
             cl_ctx.queue,
             window_kernel,
@@ -531,13 +544,11 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
             window_local,
             0,
             nullptr,
-            &window_event
+            &res.window_event
         );
         if (!check_opencl_error(err, "Failed to enqueue batch window kernel")) {
-            clReleaseMemObject(output_subbuffer);
-            clReleaseMemObject(windowed_frames_buffer);
-            clReleaseMemObject(samples_buffer);
-            continue;
+            enqueue_failed = true;
+            break;
         }
 
         err = clEnqueueNDRangeKernel(
@@ -548,38 +559,67 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
             dft_global,
             dft_local,
             1,
-            &window_event,
-            &dft_event
+            &res.window_event,
+            &res.dft_event
         );
         if (!check_opencl_error(err, "Failed to enqueue batch DFT kernel")) {
-            clReleaseEvent(window_event);
-            clReleaseMemObject(output_subbuffer);
-            clReleaseMemObject(windowed_frames_buffer);
-            clReleaseMemObject(samples_buffer);
-            continue;
+            enqueue_failed = true;
+            break;
         }
+    }
 
-        err = clFinish(cl_ctx.queue);
-        if (!check_opencl_error(err, "Failed to finish batch queue")) {
-            clReleaseEvent(dft_event);
-            clReleaseEvent(window_event);
-            clReleaseMemObject(output_subbuffer);
-            clReleaseMemObject(windowed_frames_buffer);
-            clReleaseMemObject(samples_buffer);
-            continue;
+    // Second pass: enqueue all reads after all compute work has been submitted.
+    if (!enqueue_failed) {
+        for (size_t i = 0; i < batch_samples.size(); ++i) {
+            const auto& info = infos[i];
+            auto& result = results[i];
+            auto& res = resources[i];
+
+            if (result.values.empty() || res.output_subbuffer == nullptr) {
+                continue;
+            }
+
+            err = clEnqueueReadBuffer(
+                cl_ctx.queue,
+                res.output_subbuffer,
+                CL_FALSE,
+                0,
+                info.byte_size,
+                result.values.data(),
+                1,
+                &res.dft_event,
+                &res.read_event
+            );
+            if (!check_opencl_error(err, "Failed to enqueue batch read buffer")) {
+                enqueue_failed = true;
+                break;
+            }
         }
+    }
+
+    if (!enqueue_failed) {
+        err = clFinish(cl_ctx.queue);
+        check_opencl_error(err, "Failed to finish batch queue");
+    }
+
+    double total_window_kernel_ms = 0.0;
+    double total_dft_kernel_ms = 0.0;
+
+    for (size_t i = 0; i < resources.size(); ++i) {
+        auto& res = resources[i];
 
         cl_ulong start = 0;
         cl_ulong end = 0;
 
-        if (clGetEventProfilingInfo(
-                window_event,
+        if (res.window_event != nullptr &&
+            clGetEventProfilingInfo(
+                res.window_event,
                 CL_PROFILING_COMMAND_START,
                 sizeof(cl_ulong),
                 &start,
                 nullptr) == CL_SUCCESS &&
             clGetEventProfilingInfo(
-                window_event,
+                res.window_event,
                 CL_PROFILING_COMMAND_END,
                 sizeof(cl_ulong),
                 &end,
@@ -589,14 +629,15 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
                 static_cast<double>(end - start) / 1.0e6;
         }
 
-        if (clGetEventProfilingInfo(
-                dft_event,
+        if (res.dft_event != nullptr &&
+            clGetEventProfilingInfo(
+                res.dft_event,
                 CL_PROFILING_COMMAND_START,
                 sizeof(cl_ulong),
                 &start,
                 nullptr) == CL_SUCCESS &&
             clGetEventProfilingInfo(
-                dft_event,
+                res.dft_event,
                 CL_PROFILING_COMMAND_END,
                 sizeof(cl_ulong),
                 &end,
@@ -605,25 +646,6 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
             total_dft_kernel_ms +=
                 static_cast<double>(end - start) / 1.0e6;
         }
-
-        err = clEnqueueReadBuffer(
-            cl_ctx.queue,
-            output_subbuffer,
-            CL_TRUE,
-            0,
-            info.byte_size,
-            result.values.data(),
-            0,
-            nullptr,
-            nullptr
-        );
-        check_opencl_error(err, "Failed to read batch sub-buffer");
-
-        clReleaseEvent(dft_event);
-        clReleaseEvent(window_event);
-        clReleaseMemObject(output_subbuffer);
-        clReleaseMemObject(windowed_frames_buffer);
-        clReleaseMemObject(samples_buffer);
     }
 
     std::cout << "OpenCL batch window kernel total: "
@@ -631,9 +653,34 @@ std::vector<SpectrogramResult> compute_spectrogram_opencl_batch(
     std::cout << "OpenCL batch DFT kernel total:    "
               << total_dft_kernel_ms << " ms\n";
 
+    for (auto& res : resources) {
+        if (res.read_event != nullptr) {
+            clReleaseEvent(res.read_event);
+        }
+        if (res.dft_event != nullptr) {
+            clReleaseEvent(res.dft_event);
+        }
+        if (res.window_event != nullptr) {
+            clReleaseEvent(res.window_event);
+        }
+        if (res.output_subbuffer != nullptr) {
+            clReleaseMemObject(res.output_subbuffer);
+        }
+        if (res.windowed_frames_buffer != nullptr) {
+            clReleaseMemObject(res.windowed_frames_buffer);
+        }
+        if (res.samples_buffer != nullptr) {
+            clReleaseMemObject(res.samples_buffer);
+        }
+    }
+
     clReleaseMemObject(parent_output_buffer);
     release_kernel_pair(window_kernel, dft_kernel);
     cleanup_opencl(cl_ctx);
+
+    if (enqueue_failed) {
+        std::cerr << "OpenCL batch execution encountered an error.\n";
+    }
 
     return results;
 }

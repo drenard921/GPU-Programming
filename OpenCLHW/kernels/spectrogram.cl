@@ -42,16 +42,27 @@ __kernel void dft_power_kernel(
 ) {
     const int frame = get_global_id(0);
     const int bin = get_global_id(1);
-    const int local_bin = get_local_id(1);
-    const int local_size = get_local_size(1);
+
+    const int local_frame_id = get_local_id(0);
+    const int local_bin_id = get_local_id(1);
+    const int local_bins = get_local_size(1);
 
     if (frame >= num_frames || bin >= num_bins) {
         return;
     }
 
+    /*
+     * This kernel assumes local_size[0] == 1 so that each work-group
+     * handles exactly one frame. Work-items in local dimension 1
+     * cooperate to stage that frame into local memory.
+     */
+    if (local_frame_id != 0) {
+        return;
+    }
+
     const int frame_offset = frame * window_size;
 
-    for (int n = local_bin; n < window_size; n += local_size) {
+    for (int n = local_bin_id; n < window_size; n += local_bins) {
         local_frame[n] = windowed_frames[frame_offset + n];
     }
 
@@ -66,11 +77,14 @@ __kernel void dft_power_kernel(
             (2.0f * pi * (float)bin * (float)n) /
             (float)window_size;
 
-        accum.x += sample * cos(angle);
-        accum.y -= sample * sin(angle);
+        const float c = cos(angle);
+        const float s = sin(angle);
+
+        accum.x += sample * c;
+        accum.y -= sample * s;
     }
 
-    float power = accum.x * accum.x + accum.y * accum.y;
+    float power = dot(accum, accum);
     power /= (float)(window_size * window_size);
 
     output[frame * num_bins + bin] = power;
