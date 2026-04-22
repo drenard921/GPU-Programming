@@ -278,9 +278,9 @@ Observed CPU batch timings:
 
 These runs show that spectrogram generation dominates runtime on the CPU.
 
-![CPU batch runtime on 100 blues clips]("CPU Batch runtime on 100 Blues songs.png")
+![CPU batch runtime on 100 blues clips](./CPU%20Batch%20runtime%20on%20100%20Blues%20songs.png)
 
-![CPU batch runtime alternate view]("CPU Batch time 2.png")
+![CPU batch runtime alternate view](./CPU%20Batch%20time%202.png)
 
 ## 2. OpenCL in WSL: CPU-Backed Device Selection
 
@@ -314,17 +314,17 @@ OpenCL environment, and overall speedup relative to the CPU baseline was only
 around **3.5x**. This turned out to be more of an OpenCL environment/device
 selection issue than a kernel-design issue.
 
-![WSL OpenCL batch runtime advanced view]("OpenCL Batch runtime advanced.png")
+![WSL OpenCL batch runtime advanced view](./OpenCL%20Batch%20runtime%20advanced.png)
 
-![WSL OpenCL batch runtime second advanced view]("OpenCL Batch runtime advanced2.png")
+![WSL OpenCL batch runtime second advanced view](./OpenCL%20Batch%20runtime%20advanced2.png)
 
-![WSL local-memory OpenCL runtime]("Local Memory OpenCL runtime.png")
+![WSL local-memory OpenCL runtime](./Local%20Memory%20OpenCL%20runtime.png)
 
-![WSL local-memory kernel runtimes on CPU-backed OpenCL]("Local Memory OpenCL kernel runtimes on CPU.png")
+![WSL local-memory kernel runtimes on CPU-backed OpenCL](./Local%20Memory%20OpenCL%20kernel%20runtimes%20on%20CPU.png)
 
-![WSL naive OpenCL batch runtime]("Naive OpenCL Batch Runtime.png")
+![WSL naive OpenCL batch runtime](./Naive%20OpenCL%20Batch%20Runtime.png)
 
-![WSL naive OpenCL batch kernel runtime]("Naive OpenCL Batch Kernel Runtime.png")
+![WSL naive OpenCL batch kernel runtime](./Naive%20OpenCL%20Batch%20Kernel%20Runtime.png)
 
 ## 3. Native Windows OpenCL on the NVIDIA GPU
 
@@ -362,15 +362,15 @@ direct-DFT workload and launch configuration, the overhead of local-memory
 staging and synchronization appears to outweigh the benefit of reduced
 global-memory access.
 
-![Windows OpenCL runtime on 100 blues songs]("GPU OpenCL runtime on 100 Blues songs.png")
+![Windows OpenCL runtime on 100 blues songs](./GPU%20OpenCL%20runtime%20on%20100%20Blues%20songs.png)
 
-![Windows OpenCL naive batch runtime]("GPU OpenCL Naive batch runtime.png")
+![Windows OpenCL naive batch runtime](./GPU%20OpenCL%20Naive%20batch%20runtime.png)
 
-![Windows OpenCL naive kernel runtime]("GPU OpenCL Naive kernel runtime.png")
+![Windows OpenCL naive kernel runtime](./GPU%20OpenCL%20Naive%20kernel%20runtime.png)
 
-![Windows OpenCL local-memory runtime]("GPU OpenCL Local memory Runtime.png")
+![Windows OpenCL local-memory runtime](./GPU%20OpenCL%20Local%20memory%20Runtime.png)
 
-![Windows OpenCL local kernel runtime]("GPU OpenCL Local kernel Runtime.png")
+![Windows OpenCL local kernel runtime](./GPU%20OpenCL%20Local%20kernel%20Runtime.png)
 
 ## 4. Single Long-Form Audio Benchmark: `rickroll_16bit.wav`
 
@@ -429,13 +429,13 @@ These single-file runs show that naive and local were close on this workload,
 with local slightly lowering the DFT kernel time in one run but not producing a
 clear overall end-to-end advantage.
 
-![GPU naive vs CPU baseline on RickRoll]("GPU OpenCL Naive vs CPU baseline.png")
+![GPU naive vs CPU baseline on RickRoll](./GPU%20OpenCL%20Naive%20vs%20CPU%20baseline.png)
 
-![Speedup comparison GPU vs CPU]("Speedup comparison GPU vs CPU.png")
+![Speedup comparison GPU vs CPU](./Speedup%20comparison%20GPU%20vs%20CPU.png)
 
-![GPU OpenCL RickRoll naive runtime]("GPU OpenCL RickRoll Runtime.png")
+![GPU OpenCL RickRoll naive runtime](./GPU%20OpenCL%20RickRoll%20Runtime.png)
 
-![GPU OpenCL RickRoll local runtime]("GPU OpenCL RickRoll Local Runtime.png")
+![GPU OpenCL RickRoll local runtime](./GPU%20OpenCL%20RickRoll%20Local%20Runtime.png)
 
 ## Interpretation
 
