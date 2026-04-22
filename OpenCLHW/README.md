@@ -1,7 +1,7 @@
 Dylan Renard  
 EN.605.617 Introduction to GPU Programming (JHU)  
 Professor Chance Pascale  
-April 2026  
+April 22nd 2026
 
 # OpenCL Assignment  
 ## Spectrogram Generation with CPU Baseline and OpenCL Acceleration
@@ -24,9 +24,7 @@ kernels:
 The goal of the project was to build a complete OpenCL application that
 demonstrates both basic and advanced OpenCL concepts on a practical workload,
 while also comparing CPU and GPU performance under realistic execution
-conditions. This directly aligns with the assignment emphasis on basic OpenCL
-concepts, advanced OpenCL concepts, functional build/run scripts, code
-organization, and interesting or efficient behavior.
+conditions.
 
 ## Motivation
 
@@ -47,7 +45,7 @@ Two public audio sources were used during testing.
 For batch benchmarking, the project used the GTZAN music genre dataset,
 specifically the `genres_original/blues` directory containing 100 audio clips.
 This provided a standardized 100-file workload for CPU and OpenCL batch
-comparison.
+comparison each 30 seconds in duration.
 
 For the long-form single-file benchmark, the project used a locally prepared
 `rickroll_16bit.wav` file derived from a public spectrogram lyric upload of
@@ -120,8 +118,6 @@ OpenCLHW/
 - runtime comparison of **naive** and **local-memory** kernels
 - device-aware fallback when local-memory requirements exceed capacity
 
-These features align especially well with the assignment’s encouragement to use
-buffers, sub-buffers, vectors, and broader OpenCL course concepts.
 
 ## Kernel Design
 
@@ -249,9 +245,7 @@ nmake /f Makefile.vc batch_gpu_local
 nmake /f Makefile.vc batch_both
 ```
 
-The assignment specifically rewards build and run scripts that accept command
-line arguments, so both Makefiles were designed to support configurable
-execution.
+I had issue getting my WSL environment to recongnize my Nvidia GPU so adding a windows specific Makefile was implemented to allow for practical speedup testing beyond CPU only benchmarks.
 
 ## Output
 
@@ -284,9 +278,9 @@ Observed CPU batch timings:
 
 These runs show that spectrogram generation dominates runtime on the CPU.
 
-![CPU batch runtime on 100 blues clips](CPU Batch runtime on 100 Blues songs.png)
+![CPU batch runtime on 100 blues clips]("CPU Batch runtime on 100 Blues songs.png")
 
-![CPU batch runtime alternate view](CPU Batch time 2.png)
+![CPU batch runtime alternate view]("CPU Batch time 2.png")
 
 ## 2. OpenCL in WSL: CPU-Backed Device Selection
 
@@ -320,17 +314,17 @@ OpenCL environment, and overall speedup relative to the CPU baseline was only
 around **3.5x**. This turned out to be more of an OpenCL environment/device
 selection issue than a kernel-design issue.
 
-![WSL OpenCL batch runtime advanced view](OpenCL Batch runtime advanced.png)
+![WSL OpenCL batch runtime advanced view]("OpenCL Batch runtime advanced.png")
 
-![WSL OpenCL batch runtime second advanced view](OpenCL Batch runtime advanced2.png)
+![WSL OpenCL batch runtime second advanced view]("OpenCL Batch runtime advanced2.png")
 
-![WSL local-memory OpenCL runtime](Local Memory OpenCL runtime.png)
+![WSL local-memory OpenCL runtime]("Local Memory OpenCL runtime.png")
 
-![WSL local-memory kernel runtimes on CPU-backed OpenCL](Local Memory OpenCL kernel runtimes on CPU.png)
+![WSL local-memory kernel runtimes on CPU-backed OpenCL]("Local Memory OpenCL kernel runtimes on CPU.png")
 
-![WSL naive OpenCL batch runtime](Naive OpenCL Batch Runtime.png)
+![WSL naive OpenCL batch runtime]("Naive OpenCL Batch Runtime.png")
 
-![WSL naive OpenCL batch kernel runtime](Naive OpenCL Batch Kernel Runtime.png)
+![WSL naive OpenCL batch kernel runtime]("Naive OpenCL Batch Kernel Runtime.png")
 
 ## 3. Native Windows OpenCL on the NVIDIA GPU
 
@@ -368,15 +362,15 @@ direct-DFT workload and launch configuration, the overhead of local-memory
 staging and synchronization appears to outweigh the benefit of reduced
 global-memory access.
 
-![Windows OpenCL runtime on 100 blues songs](GPU OpenCL runtime on 100 Blues songs.png)
+![Windows OpenCL runtime on 100 blues songs]("GPU OpenCL runtime on 100 Blues songs.png")
 
-![Windows OpenCL naive batch runtime](GPU OpenCL Naive batch runtime.png)
+![Windows OpenCL naive batch runtime]("GPU OpenCL Naive batch runtime.png")
 
-![Windows OpenCL naive kernel runtime](GPU OpenCL Naive kernel runtime.png)
+![Windows OpenCL naive kernel runtime]("GPU OpenCL Naive kernel runtime.png")
 
-![Windows OpenCL local-memory runtime](GPU OpenCL Local memory Runtime.png)
+![Windows OpenCL local-memory runtime]("GPU OpenCL Local memory Runtime.png")
 
-![Windows OpenCL local kernel runtime](GPU OpenCL Local kernel Runtime.png)
+![Windows OpenCL local kernel runtime]("GPU OpenCL Local kernel Runtime.png")
 
 ## 4. Single Long-Form Audio Benchmark: `rickroll_16bit.wav`
 
@@ -435,13 +429,13 @@ These single-file runs show that naive and local were close on this workload,
 with local slightly lowering the DFT kernel time in one run but not producing a
 clear overall end-to-end advantage.
 
-![GPU naive vs CPU baseline on RickRoll](GPU OpenCL Naive vs CPU baseline.png)
+![GPU naive vs CPU baseline on RickRoll]("GPU OpenCL Naive vs CPU baseline.png")
 
-![Speedup comparison GPU vs CPU](Speedup comparison GPU vs CPU.png)
+![Speedup comparison GPU vs CPU]("Speedup comparison GPU vs CPU.png")
 
-![GPU OpenCL RickRoll naive runtime](GPU OpenCL RickRoll Runtime.png)
+![GPU OpenCL RickRoll naive runtime]("GPU OpenCL RickRoll Runtime.png")
 
-![GPU OpenCL RickRoll local runtime](GPU OpenCL RickRoll Local Runtime.png)
+![GPU OpenCL RickRoll local runtime]("GPU OpenCL RickRoll Local Runtime.png")
 
 ## Interpretation
 
@@ -490,7 +484,7 @@ justifies GPU acceleration for this workload.
 ## Conclusion
 
 This project demonstrates that OpenCL can provide substantial acceleration for
-spectrogram generation when the runtime correctly targets a GPU-backed device.
+spectrogram generation whether it be a 2-3x speedup on the same hardware or a 300x speedup if employing the GPU. Demonstrating the cross-platform benefit OpenCL has agnostic of hardware. 
 The final Windows-native OpenCL implementation running on an NVIDIA GeForce
 RTX 4060 Laptop GPU achieved strong performance on both batch and single-file
 audio workloads, including a **331.7x compute speedup** over the CPU baseline
