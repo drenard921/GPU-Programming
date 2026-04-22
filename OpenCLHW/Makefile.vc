@@ -1,0 +1,88 @@
+# Makefile.vc
+# Usage:
+#   nmake /f Makefile.vc
+#   nmake /f Makefile.vc run_gpu_local
+#   nmake /f Makefile.vc run_gpu_naive
+#   nmake /f Makefile.vc batch_gpu_local
+#   nmake /f Makefile.vc batch_gpu_naive
+#   nmake /f Makefile.vc clean
+
+CXX=cl
+CXXFLAGS=/std:c++17 /EHsc /O2 /W4 /D_CRT_SECURE_NO_WARNINGS /Iinclude /I"C:\Users\drena\vcpkg\installed\x64-windows\include"
+LDFLAGS=/LIBPATH:"C:\Users\drena\vcpkg\installed\x64-windows\lib" OpenCL.lib
+
+TARGET=spectrogram.exe
+
+SRCS=src\main.cpp src\wav_reader.cpp src\spectrogram_cpu.cpp src\spectrogram_opencl.cpp src\opencl_utils.cpp src\image_writer.cpp
+
+INPUT=Data\genres_original\blues\blues.00000.wav
+BATCH_DIR=Data\genres_original\blues
+MODE=cpu
+KERNEL=local
+WINDOW=1024
+HOP=512
+BINS=512
+
+all: $(TARGET)
+
+$(TARGET):
+	@if not exist output mkdir output
+	$(CXX) $(CXXFLAGS) $(SRCS) /Fe$(TARGET) /link $(LDFLAGS)
+
+run: $(TARGET)
+!if "$(MODE)" == "cpu"
+	.\$(TARGET) "$(INPUT)" "$(MODE)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+!else
+	.\$(TARGET) "$(INPUT)" "$(MODE)" "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+!endif
+
+run_cpu: $(TARGET)
+	.\$(TARGET) "$(INPUT)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+run_gpu: $(TARGET)
+	.\$(TARGET) "$(INPUT)" gpu "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+run_gpu_naive: $(TARGET)
+	.\$(TARGET) "$(INPUT)" gpu naive "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+run_gpu_local: $(TARGET)
+	.\$(TARGET) "$(INPUT)" gpu local "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+run_both: $(TARGET)
+	.\$(TARGET) "$(INPUT)" both "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+batch_cpu: $(TARGET)
+	.\$(TARGET) "$(BATCH_DIR)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+batch_gpu: $(TARGET)
+	.\$(TARGET) "$(BATCH_DIR)" gpu "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+batch_gpu_naive: $(TARGET)
+	.\$(TARGET) "$(BATCH_DIR)" gpu naive "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+batch_gpu_local: $(TARGET)
+	.\$(TARGET) "$(BATCH_DIR)" gpu local "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+batch_both: $(TARGET)
+	.\$(TARGET) "$(BATCH_DIR)" both "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+clean:
+	@if exist $(TARGET) del /Q $(TARGET)
+	@if exist *.obj del /Q *.obj
+	@if exist src\*.obj del /Q src\*.obj
+
+help:
+	@echo Targets:
+	@echo   nmake /f Makefile.vc
+	@echo   nmake /f Makefile.vc run
+	@echo   nmake /f Makefile.vc run_cpu
+	@echo   nmake /f Makefile.vc run_gpu
+	@echo   nmake /f Makefile.vc run_gpu_naive
+	@echo   nmake /f Makefile.vc run_gpu_local
+	@echo   nmake /f Makefile.vc run_both
+	@echo   nmake /f Makefile.vc batch_cpu
+	@echo   nmake /f Makefile.vc batch_gpu
+	@echo   nmake /f Makefile.vc batch_gpu_naive
+	@echo   nmake /f Makefile.vc batch_gpu_local
+	@echo   nmake /f Makefile.vc batch_both
+	@echo   nmake /f Makefile.vc clean

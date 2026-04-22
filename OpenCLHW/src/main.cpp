@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "image_writer.h"
@@ -15,6 +16,7 @@ namespace fs = std::filesystem;
 struct AppConfig {
     std::string input_path;
     std::string mode = "cpu";
+    OpenCLKernelMode kernel_mode = OpenCLKernelMode::Local;
     int window_size = 1024;
     int hop_size = 512;
     int num_bins = 512;
@@ -32,21 +34,49 @@ bool is_valid_mode(const std::string& mode) {
     return mode == "cpu" || mode == "gpu" || mode == "both";
 }
 
+bool parse_kernel_mode_arg(
+    const std::string& text,
+    OpenCLKernelMode& kernel_mode
+) {
+    if (text == "naive") {
+        kernel_mode = OpenCLKernelMode::Naive;
+        return true;
+    }
+
+    if (text == "local") {
+        kernel_mode = OpenCLKernelMode::Local;
+        return true;
+    }
+
+    return false;
+}
+
+std::string kernel_mode_to_string(OpenCLKernelMode kernel_mode) {
+    return kernel_mode == OpenCLKernelMode::Naive ? "naive" : "local";
+}
+
 void print_usage(const char* program_name) {
     std::cout
         << "Usage:\n"
         << "  " << program_name
         << " <wav_file_or_directory> [cpu|gpu|both] "
-        << "[window_size] [hop_size] [num_bins]\n\n"
+        << "[naive|local] [window_size] [hop_size] [num_bins]\n\n"
+        << "Notes:\n"
+        << "  - Kernel mode is only used for gpu or both modes.\n"
+        << "  - If kernel mode is omitted, it defaults to local.\n\n"
         << "Examples:\n"
         << "  " << program_name
         << " Data/genres_original/blues/blues.00000.wav cpu\n"
         << "  " << program_name
-        << " Data/genres_original/blues/blues.00000.wav gpu\n"
+        << " Data/genres_original/blues/blues.00000.wav gpu local\n"
         << "  " << program_name
-        << " Data/genres_original/blues/blues.00000.wav both\n"
+        << " Data/genres_original/blues/blues.00000.wav gpu naive\n"
         << "  " << program_name
-        << " Data/genres_original/blues gpu\n";
+        << " Data/genres_original/blues/blues.00000.wav both local\n"
+        << "  " << program_name
+        << " Data/genres_original/blues gpu naive 1024 512 512\n"
+        << "  " << program_name
+        << " Data/genres_original/blues local\n";
 }
 
 bool parse_int_arg(const char* text, int& value) {
@@ -66,27 +96,58 @@ bool parse_args(int argc, char** argv, AppConfig& config) {
 
     config.input_path = argv[1];
 
-    if (argc >= 3) {
-        config.mode = argv[2];
-        if (!is_valid_mode(config.mode)) {
-            std::cerr << "Invalid mode: " << config.mode << "\n";
-            print_usage(argv[0]);
-            return false;
+    int arg_index = 2;
+
+    if (argc > arg_index) {
+        const std::string candidate = argv[arg_index];
+        if (is_valid_mode(candidate)) {
+            config.mode = candidate;
+            ++arg_index;
         }
     }
 
-    if (argc >= 4 && !parse_int_arg(argv[3], config.window_size)) {
-        std::cerr << "Invalid window_size: " << argv[3] << "\n";
-        return false;
+    if (config.mode == "gpu" || config.mode == "both") {
+        if (argc > arg_index) {
+            const std::string candidate = argv[arg_index];
+            OpenCLKernelMode parsed_mode = OpenCLKernelMode::Local;
+
+            if (parse_kernel_mode_arg(candidate, parsed_mode)) {
+                config.kernel_mode = parsed_mode;
+                ++arg_index;
+            }
+        }
     }
 
-    if (argc >= 5 && !parse_int_arg(argv[4], config.hop_size)) {
-        std::cerr << "Invalid hop_size: " << argv[4] << "\n";
+    if (argc > arg_index &&
+        !parse_int_arg(argv[arg_index], config.window_size)) {
+        std::cerr << "Invalid window_size: " << argv[arg_index] << "\n";
         return false;
     }
+    if (argc > arg_index) {
+        ++arg_index;
+    }
 
-    if (argc >= 6 && !parse_int_arg(argv[5], config.num_bins)) {
-        std::cerr << "Invalid num_bins: " << argv[5] << "\n";
+    if (argc > arg_index &&
+        !parse_int_arg(argv[arg_index], config.hop_size)) {
+        std::cerr << "Invalid hop_size: " << argv[arg_index] << "\n";
+        return false;
+    }
+    if (argc > arg_index) {
+        ++arg_index;
+    }
+
+    if (argc > arg_index &&
+        !parse_int_arg(argv[arg_index], config.num_bins)) {
+        std::cerr << "Invalid num_bins: " << argv[arg_index] << "\n";
+        return false;
+    }
+    if (argc > arg_index) {
+        ++arg_index;
+    }
+
+    if (argc > arg_index) {
+        std::cerr << "Too many arguments.\n";
+        print_usage(argv[0]);
         return false;
     }
 
@@ -114,13 +175,24 @@ bool ensure_output_directory(const std::string& output_prefix) {
 }
 
 std::string make_output_png_path(const AppConfig& config) {
+    if (config.mode == "gpu") {
+        return config.output_prefix + "_gpu_" +
+               kernel_mode_to_string(config.kernel_mode) + ".png";
+    }
+
     return config.output_prefix + "_" + config.mode + ".png";
 }
 
 std::string make_batch_output_path(
     const fs::path& input_file,
-    const std::string& mode
+    const std::string& mode,
+    OpenCLKernelMode kernel_mode
 ) {
+    if (mode == "gpu") {
+        return "output/" + input_file.stem().string() + "_" + mode + "_" +
+               kernel_mode_to_string(kernel_mode) + ".png";
+    }
+
     return "output/" + input_file.stem().string() + "_" + mode + ".png";
 }
 
@@ -130,6 +202,10 @@ void print_input_summary(const AppConfig& config, const WavData& wav) {
 
     std::cout << "Input: " << config.input_path << "\n";
     std::cout << "Mode: " << config.mode << "\n";
+    if (config.mode == "gpu" || config.mode == "both") {
+        std::cout << "OpenCL kernel mode: "
+                  << kernel_mode_to_string(config.kernel_mode) << "\n";
+    }
     std::cout << "Sample rate: " << wav.sample_rate << "\n";
     std::cout << "Channels: " << wav.channels << "\n";
     std::cout << "Samples: " << wav.samples.size() << "\n";
@@ -218,11 +294,14 @@ bool compute_spectrogram_with_timing(
             config.num_bins
         );
     } else {
+        double gpu_kernel_ms = 0.0;
         spec = compute_spectrogram_opencl(
             wav.samples,
             config.window_size,
             config.hop_size,
-            config.num_bins
+            config.num_bins,
+            &gpu_kernel_ms,
+            config.kernel_mode
         );
     }
 
@@ -293,11 +372,13 @@ bool run_pipeline(const AppConfig& config, TimingInfo& timing) {
         std::chrono::milliseconds>(total_end - total_start).count();
 
     std::cout << "Wrote image: " << output_png << "\n";
-    print_timing_summary(
-        config.mode == "cpu" ? "CPU" : "OpenCL",
-        timing
-    );
 
+    std::string label = "CPU";
+    if (config.mode == "gpu") {
+        label = "OpenCL (" + kernel_mode_to_string(config.kernel_mode) + ")";
+    }
+
+    print_timing_summary(label, timing);
     return true;
 }
 
@@ -318,7 +399,9 @@ bool run_both(const AppConfig& base_config) {
         return false;
     }
 
-    std::cout << "\n=== Running GPU ===\n";
+    std::cout << "\n=== Running GPU ("
+              << kernel_mode_to_string(gpu_config.kernel_mode)
+              << ") ===\n";
     if (!run_pipeline(gpu_config, gpu_timing)) {
         return false;
     }
@@ -346,10 +429,10 @@ std::vector<fs::path> collect_wav_files(const std::string& directory_path) {
 
 bool load_batch_wavs(
     const std::vector<fs::path>& wav_files,
-    std::vector<std::vector<float>>& batch_samples,
+    std::vector<std::pair<std::string, std::vector<float>>>& batch_inputs,
     long long& total_wav_read_ms
 ) {
-    batch_samples.clear();
+    batch_inputs.clear();
     total_wav_read_ms = 0;
 
     for (const auto& wav_path : wav_files) {
@@ -363,7 +446,7 @@ bool load_batch_wavs(
         }
 
         total_wav_read_ms += timing.wav_read_ms;
-        batch_samples.push_back(std::move(wav.samples));
+        batch_inputs.push_back({wav_path.filename().string(), std::move(wav.samples)});
     }
 
     return true;
@@ -373,6 +456,7 @@ bool write_batch_pngs(
     const std::vector<fs::path>& wav_files,
     const std::vector<SpectrogramResult>& results,
     const std::string& mode,
+    OpenCLKernelMode kernel_mode,
     long long& total_png_write_ms
 ) {
     total_png_write_ms = 0;
@@ -385,7 +469,7 @@ bool write_batch_pngs(
     for (size_t i = 0; i < wav_files.size(); ++i) {
         TimingInfo timing{};
         const std::string out_path =
-            make_batch_output_path(wav_files[i], mode);
+            make_batch_output_path(wav_files[i], mode, kernel_mode);
 
         if (!write_png_with_timing(out_path, results[i], timing)) {
             std::cerr << "Failed to write batch PNG: "
@@ -445,7 +529,9 @@ bool run_batch_cpu(const AppConfig& config, TimingInfo& timing) {
         total_spec_ms += std::chrono::duration_cast<
             std::chrono::milliseconds>(spec_end - spec_start).count();
 
-        const std::string out_path = make_batch_output_path(wav_path, "cpu");
+        const std::string out_path =
+            make_batch_output_path(wav_path, "cpu", OpenCLKernelMode::Local);
+
         if (!write_png_with_timing(out_path, spec, file_timing)) {
             return false;
         }
@@ -490,29 +576,39 @@ bool run_batch_gpu(const AppConfig& config, TimingInfo& timing) {
         return false;
     }
 
-    std::vector<std::vector<float>> batch_samples;
+    std::vector<std::pair<std::string, std::vector<float>>> batch_inputs;
 
     auto total_start = std::chrono::high_resolution_clock::now();
 
     if (!load_batch_wavs(
             wav_files,
-            batch_samples,
+            batch_inputs,
             timing.wav_read_ms)) {
         return false;
     }
 
+    std::vector<double> gpu_times_ms;
+
     auto spec_start = std::chrono::high_resolution_clock::now();
-    auto results = compute_spectrogram_opencl_batch(
-        batch_samples,
+    auto results_with_names = compute_spectrogram_opencl_batch(
+        batch_inputs,
         config.window_size,
         config.hop_size,
-        config.num_bins
+        config.num_bins,
+        &gpu_times_ms,
+        config.kernel_mode
     );
     auto spec_end = std::chrono::high_resolution_clock::now();
 
-    if (results.size() != wav_files.size()) {
+    if (results_with_names.size() != wav_files.size()) {
         std::cerr << "Batch OpenCL computation failed.\n";
         return false;
+    }
+
+    std::vector<SpectrogramResult> results;
+    results.reserve(results_with_names.size());
+    for (const auto& item : results_with_names) {
+        results.push_back(item.second);
     }
 
     timing.spectrogram_ms =
@@ -523,6 +619,7 @@ bool run_batch_gpu(const AppConfig& config, TimingInfo& timing) {
             wav_files,
             results,
             "gpu",
+            config.kernel_mode,
             timing.image_write_ms)) {
         return false;
     }
@@ -533,8 +630,10 @@ bool run_batch_gpu(const AppConfig& config, TimingInfo& timing) {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             total_end - total_start).count();
 
-    std::cout << "\nOpenCL Batch Runtime Summary\n";
-    std::cout << "----------------------------\n";
+    std::cout << "\nOpenCL Batch Runtime Summary ("
+              << kernel_mode_to_string(config.kernel_mode)
+              << ")\n";
+    std::cout << "-----------------------------------\n";
     std::cout << "Files processed:       "
               << wav_files.size() << "\n";
     std::cout << "WAV read time:         "
@@ -545,6 +644,16 @@ bool run_batch_gpu(const AppConfig& config, TimingInfo& timing) {
               << timing.image_write_ms << " ms\n";
     std::cout << "Total runtime:         "
               << timing.total_ms << " ms\n";
+
+    if (!gpu_times_ms.empty()) {
+        long long total_kernel_ms = 0;
+        for (double ms : gpu_times_ms) {
+            total_kernel_ms += static_cast<long long>(ms);
+        }
+
+        std::cout << "Summed GPU kernel ms:  "
+                  << total_kernel_ms << " ms\n";
+    }
 
     return true;
 }
@@ -564,7 +673,9 @@ bool run_batch_both(const AppConfig& base_config) {
         return false;
     }
 
-    std::cout << "\n=== Running Batch GPU ===\n";
+    std::cout << "\n=== Running Batch GPU ("
+              << kernel_mode_to_string(gpu_config.kernel_mode)
+              << ") ===\n";
     if (!run_batch_gpu(gpu_config, gpu_timing)) {
         return false;
     }

@@ -32,7 +32,7 @@ __kernel void window_kernel(
         samples[sample_index] * w;
 }
 
-__kernel void dft_power_kernel(
+__kernel void dft_power_kernel_local(
     __global const float* windowed_frames,
     __global float* output,
     __local float* local_frame,
@@ -73,6 +73,43 @@ __kernel void dft_power_kernel(
 
     for (int n = 0; n < window_size; ++n) {
         const float sample = local_frame[n];
+        const float angle =
+            (2.0f * pi * (float)bin * (float)n) /
+            (float)window_size;
+
+        const float c = cos(angle);
+        const float s = sin(angle);
+
+        accum.x += sample * c;
+        accum.y -= sample * s;
+    }
+
+    float power = dot(accum, accum);
+    power /= (float)(window_size * window_size);
+
+    output[frame * num_bins + bin] = power;
+}
+
+__kernel void dft_power_kernel_naive(
+    __global const float* windowed_frames,
+    __global float* output,
+    const int window_size,
+    const int num_bins,
+    const int num_frames
+) {
+    const int frame = get_global_id(0);
+    const int bin = get_global_id(1);
+
+    if (frame >= num_frames || bin >= num_bins) {
+        return;
+    }
+
+    const int frame_offset = frame * window_size;
+    const float pi = 3.14159265358979323846f;
+    float2 accum = (float2)(0.0f, 0.0f);
+
+    for (int n = 0; n < window_size; ++n) {
+        const float sample = windowed_frames[frame_offset + n];
         const float angle =
             (2.0f * pi * (float)bin * (float)n) /
             (float)window_size;
