@@ -1,3 +1,24 @@
+/*
+ * opencl_utils.cpp
+ *
+ * Helper functions for OpenCL platform discovery, device selection,
+ * program compilation, command queue creation, and resource cleanup.
+ *
+ * This file centralizes the host-side OpenCL setup used by the
+ * spectrogram application. It loads kernel source code from disk,
+ * selects an available device, builds the OpenCL program, creates
+ * a profiling-enabled command queue, and provides cleanup utilities
+ * for releasing OpenCL resources safely.
+ *
+ * High-level responsibilities:
+ *   1. Query available OpenCL platforms and devices.
+ *   2. Select a usable device, preferring GPU when available.
+ *   3. Load and compile the kernel source file.
+ *   4. Create the OpenCL context and command queue.
+ *   5. Report build errors and device information.
+ *   6. Release OpenCL resources during shutdown or failure.
+ */
+
 #include "opencl_utils.h"
 
 #include <fstream>
@@ -7,6 +28,11 @@
 
 namespace {
 
+/*
+ * Returns the first available device of the requested type for the
+ * given platform. This is used to prefer GPU execution while still
+ * allowing fallback to default or CPU devices.
+ */
 bool get_first_device_for_type(
     cl_platform_id platform,
     cl_device_type device_type,
@@ -42,6 +68,10 @@ bool get_first_device_for_type(
     return true;
 }
 
+/*
+ * Prints the vendor and device name of the selected OpenCL device
+ * so the runtime configuration is visible to the user.
+ */
 void print_selected_device_info(cl_device_id device) {
     if (device == nullptr) {
         return;
@@ -69,6 +99,7 @@ void print_selected_device_info(cl_device_id device) {
 
 }  // namespace
 
+/* Prints an error message when an OpenCL API call fails. */
 bool check_opencl_error(
     cl_int err,
     const std::string& message
@@ -80,6 +111,7 @@ bool check_opencl_error(
     return true;
 }
 
+/* Reads the OpenCL kernel source file from disk into a single string. */
 std::string load_kernel_source(const std::string& kernel_path) {
     std::ifstream file(kernel_path);
     if (!file) {
@@ -93,6 +125,10 @@ std::string load_kernel_source(const std::string& kernel_path) {
     return buffer.str();
 }
 
+/*
+ * Retrieves and prints the OpenCL compiler build log when program
+ * compilation fails, which helps diagnose kernel syntax or device-specific issues.
+ */
 void print_build_log(
     cl_program program,
     cl_device_id device
@@ -132,6 +168,22 @@ void print_build_log(
     std::cerr << log.data() << "\n";
 }
 
+/*
+ * Initializes the OpenCL runtime for the application.
+ *
+ * This function:
+ *   1. Queries available OpenCL platforms.
+ *   2. Selects the first platform and a usable device.
+ *   3. Creates an OpenCL context for that device.
+ *   4. Creates a command queue with profiling enabled.
+ *   5. Loads kernel source code from disk.
+ *   6. Builds the OpenCL program for the selected device.
+ *
+ * Device preference order:
+ *   GPU -> default device -> CPU
+ *
+ * On failure, any partially created resources are released before returning.
+ */
 bool initialize_opencl(
     OpenCLContext& cl_ctx,
     const std::string& kernel_path
@@ -261,6 +313,10 @@ bool initialize_opencl(
     return true;
 }
 
+/*
+ * Releases OpenCL resources owned by the context structure and resets
+ * all handles to null so repeated cleanup calls remain safe.
+ */
 void cleanup_opencl(OpenCLContext& cl_ctx) {
     if (cl_ctx.program != nullptr) {
         clReleaseProgram(cl_ctx.program);

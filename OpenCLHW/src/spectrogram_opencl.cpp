@@ -1,3 +1,31 @@
+/*
+ * spectrogram_opencl.cpp
+ *
+ * OpenCL-based spectrogram computation for both single-input and batch modes.
+ *
+ * This file manages the host-side GPU execution flow for the spectrogram
+ * application. It initializes OpenCL resources, creates kernel objects,
+ * allocates device buffers, sets kernel arguments, launches the windowing
+ * and DFT kernels, reads results back to the host, and records kernel timing
+ * through OpenCL profiling events.
+ *
+ * Supported execution paths:
+ *   1. compute_spectrogram_opencl
+ *      Runs the OpenCL spectrogram pipeline for one audio signal.
+ *
+ *   2. compute_spectrogram_opencl_batch
+ *      Runs the same pipeline across multiple audio inputs and stores each
+ *      result separately while reusing a shared OpenCL context.
+ *
+ * Notes:
+ *   - The OpenCL implementation supports both naive and local-memory DFT
+ *     kernels.
+ *   - The local kernel may fall back to the naive kernel if the device does
+ *     not report enough local memory for the requested window size.
+ *   - Timing is collected with OpenCL events so kernel execution cost can be
+ *     compared against the CPU baseline.
+ */
+
 #include "spectrogram_opencl.h"
 
 #include <iostream>
@@ -10,6 +38,7 @@
 
 namespace {
 
+/* Stores per-input output layout information for batch OpenCL execution. */
 struct BatchItemInfo {
     int num_frames = 0;
     int num_bins = 0;
@@ -18,6 +47,10 @@ struct BatchItemInfo {
     size_t byte_size = 0;
 };
 
+/*
+ * Stores OpenCL buffers and profiling events associated with one batch item
+ * so they can be released cleanly after execution.
+ */
 struct BatchRunResources {
     cl_mem samples_buffer = nullptr;
     cl_mem windowed_frames_buffer = nullptr;
@@ -27,6 +60,31 @@ struct BatchRunResources {
     cl_event read_event = nullptr;
 };
 
+/*
+ * Stores device buffers and profiling events for one single-file OpenCL run.
+ * Grouping these together keeps allocation and cleanup logic compact.
+ */
+struct SingleRunResources {
+    cl_mem samples_buffer = nullptr;
+    cl_mem windowed_frames_buffer = nullptr;
+    cl_mem output_buffer = nullptr;
+    cl_event window_event = nullptr;
+    cl_event dft_event = nullptr;
+};
+
+/*
+ * Stores local and global NDRange sizes for the two-stage OpenCL pipeline.
+ * The window kernel uses one frame dimension and one sample dimension, while
+ * the DFT kernel uses one frame dimension and one frequency-bin dimension.
+ */
+struct KernelLaunchConfig {
+    size_t window_local[2] = {1, 64};
+    size_t window_global[2] = {0, 0};
+    size_t dft_local[2] = {1, 16};
+    size_t dft_global[2] = {0, 0};
+};
+
+/* Rounds value up to the nearest multiple used for global work sizes. */
 size_t round_up(size_t value, size_t multiple) {
     if (multiple == 0) {
         return value;
@@ -40,6 +98,7 @@ size_t round_up(size_t value, size_t multiple) {
     return value + multiple - remainder;
 }
 
+/* Returns the elapsed execution time of a profiling event in milliseconds. */
 double get_event_time_ms(cl_event event) {
     if (event == nullptr) {
         return 0.0;
@@ -71,6 +130,7 @@ double get_event_time_ms(cl_event event) {
     return static_cast<double>(end - start) / 1.0e6;
 }
 
+/* Prints a labeled event timing value when profiling information is available. */
 void print_event_time_ms(
     cl_event event,
     const std::string& label
@@ -81,6 +141,10 @@ void print_event_time_ms(
     }
 }
 
+/*
+ * Creates the OpenCL kernel handles needed by the spectrogram pipeline:
+ * one windowing kernel and two DFT kernel variants.
+ */
 bool create_kernels(
     const OpenCLContext& cl_ctx,
     cl_kernel& window_kernel,
@@ -125,6 +189,7 @@ bool create_kernels(
     return true;
 }
 
+/* Releases all kernel handles created for the spectrogram pipeline. */
 void release_kernel_set(
     cl_kernel& window_kernel,
     cl_kernel& dft_kernel_naive,
@@ -146,6 +211,12 @@ void release_kernel_set(
     }
 }
 
+/*
+ * Resolves which DFT kernel should actually run.
+ * If local-memory mode is requested but the device does not have enough
+ * local memory for the frame size, the implementation falls back to
+ * the naive kernel for correctness and portability.
+ */
 OpenCLKernelMode resolve_kernel_mode(
     cl_device_id device,
     int window_size,
@@ -187,6 +258,7 @@ OpenCLKernelMode resolve_kernel_mode(
     return OpenCLKernelMode::Local;
 }
 
+/* Sets all arguments required by the windowing kernel. */
 bool set_window_kernel_args(
     cl_kernel window_kernel,
     cl_mem samples_buffer,
@@ -213,6 +285,10 @@ bool set_window_kernel_args(
     return check_opencl_error(err, "Failed to set window kernel arguments");
 }
 
+/*
+ * Sets arguments for either the naive or local-memory DFT kernel,
+ * accounting for the different parameter layouts of the two kernels.
+ */
 bool set_dft_kernel_args(
     cl_kernel dft_kernel,
     OpenCLKernelMode kernel_mode,
@@ -265,6 +341,38 @@ bool set_dft_kernel_args(
     );
 }
 
+/* Releases buffers and events created for one single-file OpenCL run. */
+void release_single_resources(SingleRunResources& res) {
+    if (res.dft_event != nullptr) {
+        clReleaseEvent(res.dft_event);
+        res.dft_event = nullptr;
+    }
+
+    if (res.window_event != nullptr) {
+        clReleaseEvent(res.window_event);
+        res.window_event = nullptr;
+    }
+
+    if (res.output_buffer != nullptr) {
+        clReleaseMemObject(res.output_buffer);
+        res.output_buffer = nullptr;
+    }
+
+    if (res.windowed_frames_buffer != nullptr) {
+        clReleaseMemObject(res.windowed_frames_buffer);
+        res.windowed_frames_buffer = nullptr;
+    }
+
+    if (res.samples_buffer != nullptr) {
+        clReleaseMemObject(res.samples_buffer);
+        res.samples_buffer = nullptr;
+    }
+}
+
+/*
+ * Releases all per-item OpenCL buffers and profiling events created during
+ * batch execution.
+ */
 void release_batch_resources(std::vector<BatchRunResources>& resources) {
     for (auto& res : resources) {
         if (res.read_event != nullptr) {
@@ -299,17 +407,19 @@ void release_batch_resources(std::vector<BatchRunResources>& resources) {
     }
 }
 
-}  // namespace
-
-SpectrogramResult compute_spectrogram_opencl(
+/*
+ * Validates single-run parameters, initializes the output container, and
+ * resets the optional GPU timing output.
+ */
+bool initialize_single_result(
     const std::vector<float>& samples,
     int window_size,
     int hop_size,
     int num_bins,
-    double* gpu_time_ms,
-    OpenCLKernelMode kernel_mode
+    SpectrogramResult& result,
+    double* gpu_time_ms
 ) {
-    SpectrogramResult result{};
+    result = SpectrogramResult{};
 
     if (gpu_time_ms != nullptr) {
         *gpu_time_ms = 0.0;
@@ -317,12 +427,12 @@ SpectrogramResult compute_spectrogram_opencl(
 
     if (window_size <= 0 || hop_size <= 0 || num_bins <= 0) {
         std::cerr << "Invalid OpenCL spectrogram parameters.\n";
-        return result;
+        return false;
     }
 
     if (static_cast<int>(samples.size()) < window_size) {
         std::cerr << "Not enough samples for OpenCL spectrogram.\n";
-        return result;
+        return false;
     }
 
     result.num_frames =
@@ -334,40 +444,20 @@ SpectrogramResult compute_spectrogram_opencl(
         0.0f
     );
 
-    OpenCLContext cl_ctx{};
-    if (!initialize_opencl(cl_ctx, "kernels/spectrogram.cl")) {
-        std::cerr << "Failed to initialize OpenCL.\n";
-        return {};
-    }
+    return true;
+}
 
-    OpenCLKernelMode actual_mode = resolve_kernel_mode(
-        cl_ctx.device,
-        window_size,
-        kernel_mode
-    );
-
-    cl_kernel window_kernel = nullptr;
-    cl_kernel dft_kernel_naive = nullptr;
-    cl_kernel dft_kernel_local = nullptr;
-
-    if (!create_kernels(
-            cl_ctx,
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local)) {
-        cleanup_opencl(cl_ctx);
-        return {};
-    }
-
-    cl_kernel selected_dft_kernel =
-        (actual_mode == OpenCLKernelMode::Local)
-            ? dft_kernel_local
-            : dft_kernel_naive;
-
+/* Allocates the device buffers needed for one spectrogram run. */
+bool create_single_buffers(
+    const OpenCLContext& cl_ctx,
+    const std::vector<float>& samples,
+    const SpectrogramResult& result,
+    int window_size,
+    SingleRunResources& res
+) {
     cl_int err = CL_SUCCESS;
-    const int num_samples = static_cast<int>(samples.size());
 
-    cl_mem samples_buffer = clCreateBuffer(
+    res.samples_buffer = clCreateBuffer(
         cl_ctx.context,
         CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         sizeof(float) * samples.size(),
@@ -375,16 +465,10 @@ SpectrogramResult compute_spectrogram_opencl(
         &err
     );
     if (!check_opencl_error(err, "Failed to create samples buffer")) {
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
+        return false;
     }
 
-    cl_mem windowed_frames_buffer = clCreateBuffer(
+    res.windowed_frames_buffer = clCreateBuffer(
         cl_ctx.context,
         CL_MEM_READ_WRITE,
         sizeof(float) * static_cast<size_t>(result.num_frames) *
@@ -393,17 +477,10 @@ SpectrogramResult compute_spectrogram_opencl(
         &err
     );
     if (!check_opencl_error(err, "Failed to create windowed frames buffer")) {
-        clReleaseMemObject(samples_buffer);
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
+        return false;
     }
 
-    cl_mem output_buffer = clCreateBuffer(
+    res.output_buffer = clCreateBuffer(
         cl_ctx.context,
         CL_MEM_WRITE_ONLY,
         sizeof(float) * result.values.size(),
@@ -411,154 +488,149 @@ SpectrogramResult compute_spectrogram_opencl(
         &err
     );
     if (!check_opencl_error(err, "Failed to create output buffer")) {
-        clReleaseMemObject(windowed_frames_buffer);
-        clReleaseMemObject(samples_buffer);
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
+        return false;
     }
 
+    return true;
+}
+
+/*
+ * Configures both pipeline stages for the single-run path:
+ * the window kernel and whichever DFT kernel was selected.
+ */
+bool set_single_kernel_args(
+    cl_kernel window_kernel,
+    cl_kernel dft_kernel,
+    OpenCLKernelMode actual_mode,
+    const SingleRunResources& res,
+    int num_samples,
+    int window_size,
+    int hop_size,
+    int num_bins,
+    int num_frames
+) {
     if (!set_window_kernel_args(
             window_kernel,
-            samples_buffer,
-            windowed_frames_buffer,
+            res.samples_buffer,
+            res.windowed_frames_buffer,
             num_samples,
             window_size,
             hop_size,
-            result.num_frames)) {
-        clReleaseMemObject(output_buffer);
-        clReleaseMemObject(windowed_frames_buffer);
-        clReleaseMemObject(samples_buffer);
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
+            num_frames)) {
+        return false;
     }
 
-    if (!set_dft_kernel_args(
-            selected_dft_kernel,
-            actual_mode,
-            windowed_frames_buffer,
-            output_buffer,
-            window_size,
-            num_bins,
-            result.num_frames)) {
-        clReleaseMemObject(output_buffer);
-        clReleaseMemObject(windowed_frames_buffer);
-        clReleaseMemObject(samples_buffer);
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
-    }
+    return set_dft_kernel_args(
+        dft_kernel,
+        actual_mode,
+        res.windowed_frames_buffer,
+        res.output_buffer,
+        window_size,
+        num_bins,
+        num_frames
+    );
+}
 
-    const size_t window_local[2] = {1, 64};
-    const size_t window_global[2] = {
-        static_cast<size_t>(result.num_frames),
-        round_up(static_cast<size_t>(window_size), window_local[1])
-    };
+/* Computes local and global launch sizes for the two-stage pipeline. */
+KernelLaunchConfig make_launch_config(
+    int num_frames,
+    int window_size,
+    int num_bins
+) {
+    KernelLaunchConfig cfg{};
 
-    const size_t dft_local[2] = {1, 16};
-    const size_t dft_global[2] = {
-        static_cast<size_t>(result.num_frames),
-        round_up(static_cast<size_t>(num_bins), dft_local[1])
-    };
+    cfg.window_global[0] = static_cast<size_t>(num_frames);
+    cfg.window_global[1] = round_up(
+        static_cast<size_t>(window_size),
+        cfg.window_local[1]
+    );
 
-    cl_event window_event = nullptr;
-    cl_event dft_event = nullptr;
+    cfg.dft_global[0] = static_cast<size_t>(num_frames);
+    cfg.dft_global[1] = round_up(
+        static_cast<size_t>(num_bins),
+        cfg.dft_local[1]
+    );
 
-    err = clEnqueueNDRangeKernel(
+    return cfg;
+}
+
+/*
+ * Enqueues the window kernel first, then enqueues the DFT kernel with an
+ * event dependency so the second stage only begins after windowing finishes.
+ */
+bool enqueue_single_pipeline(
+    const OpenCLContext& cl_ctx,
+    cl_kernel window_kernel,
+    cl_kernel dft_kernel,
+    const KernelLaunchConfig& cfg,
+    SingleRunResources& res
+) {
+    cl_int err = clEnqueueNDRangeKernel(
         cl_ctx.queue,
         window_kernel,
         2,
         nullptr,
-        window_global,
-        window_local,
+        cfg.window_global,
+        cfg.window_local,
         0,
         nullptr,
-        &window_event
+        &res.window_event
     );
     if (!check_opencl_error(err, "Failed to enqueue window kernel")) {
-        clReleaseMemObject(output_buffer);
-        clReleaseMemObject(windowed_frames_buffer);
-        clReleaseMemObject(samples_buffer);
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
+        return false;
     }
 
     err = clEnqueueNDRangeKernel(
         cl_ctx.queue,
-        selected_dft_kernel,
+        dft_kernel,
         2,
         nullptr,
-        dft_global,
-        dft_local,
+        cfg.dft_global,
+        cfg.dft_local,
         1,
-        &window_event,
-        &dft_event
+        &res.window_event,
+        &res.dft_event
     );
     if (!check_opencl_error(err, "Failed to enqueue DFT kernel")) {
-        clReleaseEvent(window_event);
-        clReleaseMemObject(output_buffer);
-        clReleaseMemObject(windowed_frames_buffer);
-        clReleaseMemObject(samples_buffer);
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
+        return false;
     }
 
-    err = clFinish(cl_ctx.queue);
+    return true;
+}
+
+/*
+ * Waits for queued work to finish, reports profiling times, and reads the
+ * computed spectrogram values back to host memory.
+ */
+bool finalize_single_run(
+    const OpenCLContext& cl_ctx,
+    const SingleRunResources& res,
+    OpenCLKernelMode actual_mode,
+    SpectrogramResult& result,
+    double* gpu_time_ms
+) {
+    cl_int err = clFinish(cl_ctx.queue);
     if (!check_opencl_error(err, "Failed to finish OpenCL queue")) {
-        clReleaseEvent(dft_event);
-        clReleaseEvent(window_event);
-        clReleaseMemObject(output_buffer);
-        clReleaseMemObject(windowed_frames_buffer);
-        clReleaseMemObject(samples_buffer);
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
+        return false;
     }
 
-    print_event_time_ms(window_event, "OpenCL window kernel");
+    print_event_time_ms(res.window_event, "OpenCL window kernel");
     print_event_time_ms(
-        dft_event,
+        res.dft_event,
         actual_mode == OpenCLKernelMode::Local
             ? "OpenCL DFT kernel (local)"
             : "OpenCL DFT kernel (naive)"
     );
 
-    const double total_gpu_kernel_ms =
-        get_event_time_ms(window_event) + get_event_time_ms(dft_event);
     if (gpu_time_ms != nullptr) {
-        *gpu_time_ms = total_gpu_kernel_ms;
+        *gpu_time_ms =
+            get_event_time_ms(res.window_event) +
+            get_event_time_ms(res.dft_event);
     }
 
     err = clEnqueueReadBuffer(
         cl_ctx.queue,
-        output_buffer,
+        res.output_buffer,
         CL_TRUE,
         0,
         sizeof(float) * result.values.size(),
@@ -567,62 +639,27 @@ SpectrogramResult compute_spectrogram_opencl(
         nullptr,
         nullptr
     );
-    if (!check_opencl_error(err, "Failed to read OpenCL output buffer")) {
-        clReleaseEvent(dft_event);
-        clReleaseEvent(window_event);
-        clReleaseMemObject(output_buffer);
-        clReleaseMemObject(windowed_frames_buffer);
-        clReleaseMemObject(samples_buffer);
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
-    }
 
-    clReleaseEvent(dft_event);
-    clReleaseEvent(window_event);
-    clReleaseMemObject(output_buffer);
-    clReleaseMemObject(windowed_frames_buffer);
-    clReleaseMemObject(samples_buffer);
-    release_kernel_set(
-        window_kernel,
-        dft_kernel_naive,
-        dft_kernel_local
-    );
-    cleanup_opencl(cl_ctx);
-
-    return result;
+    return check_opencl_error(err, "Failed to read OpenCL output buffer");
 }
 
-std::vector<std::pair<std::string, SpectrogramResult>>
-compute_spectrogram_opencl_batch(
+/*
+ * Precomputes the output layout for batch mode.
+ * Each valid input is assigned a region inside the parent output buffer, and
+ * each corresponding SpectrogramResult is sized in advance.
+ */
+void initialize_batch_layout(
     const std::vector<std::pair<std::string, std::vector<float>>>& batch_inputs,
     int window_size,
     int hop_size,
     int num_bins,
-    std::vector<double>* gpu_times_ms,
-    OpenCLKernelMode kernel_mode
+    std::vector<std::pair<std::string, SpectrogramResult>>& results,
+    std::vector<BatchItemInfo>& infos,
+    size_t& total_output_bytes
 ) {
-    std::vector<std::pair<std::string, SpectrogramResult>> results;
-    std::vector<BatchItemInfo> infos;
-    std::vector<BatchRunResources> resources;
-    size_t total_output_bytes = 0;
-
-    if (gpu_times_ms != nullptr) {
-        gpu_times_ms->clear();
-    }
-
-    if (window_size <= 0 || hop_size <= 0 || num_bins <= 0) {
-        std::cerr << "Invalid OpenCL batch spectrogram parameters.\n";
-        return results;
-    }
-
     results.resize(batch_inputs.size());
     infos.resize(batch_inputs.size());
-    resources.resize(batch_inputs.size());
+    total_output_bytes = 0;
 
     for (size_t i = 0; i < batch_inputs.size(); ++i) {
         const auto& name = batch_inputs[i].first;
@@ -649,225 +686,207 @@ compute_spectrogram_opencl_batch(
         results[i].second.num_bins = num_bins;
         results[i].second.values.resize(infos[i].value_count, 0.0f);
     }
+}
 
-    OpenCLContext cl_ctx{};
-    if (!initialize_opencl(cl_ctx, "kernels/spectrogram.cl")) {
-        std::cerr << "Failed to initialize OpenCL for batch mode.\n";
-        return {};
-    }
-
-    OpenCLKernelMode actual_mode = resolve_kernel_mode(
-        cl_ctx.device,
-        window_size,
-        kernel_mode
-    );
-
-    cl_kernel window_kernel = nullptr;
-    cl_kernel dft_kernel_naive = nullptr;
-    cl_kernel dft_kernel_local = nullptr;
-
-    if (!create_kernels(
-            cl_ctx,
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local)) {
-        cleanup_opencl(cl_ctx);
-        return {};
-    }
-
-    cl_kernel selected_dft_kernel =
-        (actual_mode == OpenCLKernelMode::Local)
-            ? dft_kernel_local
-            : dft_kernel_naive;
-
+/*
+ * Creates the shared parent output buffer used in batch mode.
+ * Each input's spectrogram output is exposed through a sub-buffer region of
+ * this larger allocation.
+ */
+cl_mem create_parent_output_buffer(
+    const OpenCLContext& cl_ctx,
+    size_t total_output_bytes
+) {
     cl_int err = CL_SUCCESS;
 
-    cl_mem parent_output_buffer = clCreateBuffer(
+    return clCreateBuffer(
         cl_ctx.context,
         CL_MEM_WRITE_ONLY,
         total_output_bytes,
         nullptr,
         &err
     );
-    if (!check_opencl_error(err, "Failed to create parent output buffer")) {
-        release_kernel_set(
-            window_kernel,
-            dft_kernel_naive,
-            dft_kernel_local
-        );
-        cleanup_opencl(cl_ctx);
-        return {};
+}
+
+/*
+ * Creates per-item buffers, sub-buffer output view, and kernel arguments for
+ * one batch input, then enqueues both pipeline stages for that item.
+ */
+bool enqueue_batch_item(
+    const OpenCLContext& cl_ctx,
+    cl_kernel window_kernel,
+    cl_kernel dft_kernel,
+    OpenCLKernelMode actual_mode,
+    cl_mem parent_output_buffer,
+    const std::vector<float>& samples,
+    const BatchItemInfo& info,
+    SpectrogramResult& result,
+    int window_size,
+    int hop_size,
+    int num_bins,
+    BatchRunResources& res
+) {
+    cl_int err = CL_SUCCESS;
+    const int num_samples = static_cast<int>(samples.size());
+
+    res.samples_buffer = clCreateBuffer(
+        cl_ctx.context,
+        CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        sizeof(float) * samples.size(),
+        const_cast<float*>(samples.data()),
+        &err
+    );
+    if (!check_opencl_error(err, "Failed to create batch samples buffer")) {
+        return false;
     }
 
-    const size_t window_local[2] = {1, 64};
-    const size_t dft_local[2] = {1, 16};
+    res.windowed_frames_buffer = clCreateBuffer(
+        cl_ctx.context,
+        CL_MEM_READ_WRITE,
+        sizeof(float) * static_cast<size_t>(result.num_frames) *
+            static_cast<size_t>(window_size),
+        nullptr,
+        &err
+    );
+    if (!check_opencl_error(
+            err,
+            "Failed to create batch windowed frames buffer")) {
+        return false;
+    }
 
-    bool enqueue_failed = false;
+    cl_buffer_region region{};
+    region.origin = info.byte_offset;
+    region.size = info.byte_size;
 
-    for (size_t i = 0; i < batch_inputs.size(); ++i) {
-        const auto& samples = batch_inputs[i].second;
+    res.output_subbuffer = clCreateSubBuffer(
+        parent_output_buffer,
+        CL_MEM_WRITE_ONLY,
+        CL_BUFFER_CREATE_TYPE_REGION,
+        &region,
+        &err
+    );
+    if (!check_opencl_error(err, "Failed to create output sub-buffer")) {
+        return false;
+    }
+
+    if (!set_window_kernel_args(
+            window_kernel,
+            res.samples_buffer,
+            res.windowed_frames_buffer,
+            num_samples,
+            window_size,
+            hop_size,
+            result.num_frames)) {
+        return false;
+    }
+
+    if (!set_dft_kernel_args(
+            dft_kernel,
+            actual_mode,
+            res.windowed_frames_buffer,
+            res.output_subbuffer,
+            window_size,
+            num_bins,
+            result.num_frames)) {
+        return false;
+    }
+
+    const KernelLaunchConfig cfg = make_launch_config(
+        result.num_frames,
+        window_size,
+        num_bins
+    );
+
+    err = clEnqueueNDRangeKernel(
+        cl_ctx.queue,
+        window_kernel,
+        2,
+        nullptr,
+        cfg.window_global,
+        cfg.window_local,
+        0,
+        nullptr,
+        &res.window_event
+    );
+    if (!check_opencl_error(err, "Failed to enqueue batch window kernel")) {
+        return false;
+    }
+
+    err = clEnqueueNDRangeKernel(
+        cl_ctx.queue,
+        dft_kernel,
+        2,
+        nullptr,
+        cfg.dft_global,
+        cfg.dft_local,
+        1,
+        &res.window_event,
+        &res.dft_event
+    );
+    if (!check_opencl_error(err, "Failed to enqueue batch DFT kernel")) {
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * Enqueues asynchronous readbacks for every valid batch item after its DFT
+ * event completes.
+ */
+bool enqueue_batch_reads(
+    const OpenCLContext& cl_ctx,
+    const std::vector<BatchItemInfo>& infos,
+    std::vector<std::pair<std::string, SpectrogramResult>>& results,
+    std::vector<BatchRunResources>& resources
+) {
+    for (size_t i = 0; i < resources.size(); ++i) {
         const auto& info = infos[i];
         auto& result = results[i].second;
         auto& res = resources[i];
 
-        if (result.values.empty()) {
+        if (result.values.empty() || res.output_subbuffer == nullptr) {
             continue;
         }
 
-        const int num_samples = static_cast<int>(samples.size());
-
-        res.samples_buffer = clCreateBuffer(
-            cl_ctx.context,
-            CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-            sizeof(float) * samples.size(),
-            const_cast<float*>(samples.data()),
-            &err
-        );
-        if (!check_opencl_error(err, "Failed to create batch samples buffer")) {
-            enqueue_failed = true;
-            break;
-        }
-
-        res.windowed_frames_buffer = clCreateBuffer(
-            cl_ctx.context,
-            CL_MEM_READ_WRITE,
-            sizeof(float) * static_cast<size_t>(result.num_frames) *
-                static_cast<size_t>(window_size),
-            nullptr,
-            &err
-        );
-        if (!check_opencl_error(
-                err,
-                "Failed to create batch windowed frames buffer")) {
-            enqueue_failed = true;
-            break;
-        }
-
-        cl_buffer_region region{};
-        region.origin = info.byte_offset;
-        region.size = info.byte_size;
-
-        res.output_subbuffer = clCreateSubBuffer(
-            parent_output_buffer,
-            CL_MEM_WRITE_ONLY,
-            CL_BUFFER_CREATE_TYPE_REGION,
-            &region,
-            &err
-        );
-        if (!check_opencl_error(err, "Failed to create output sub-buffer")) {
-            enqueue_failed = true;
-            break;
-        }
-
-        if (!set_window_kernel_args(
-                window_kernel,
-                res.samples_buffer,
-                res.windowed_frames_buffer,
-                num_samples,
-                window_size,
-                hop_size,
-                result.num_frames)) {
-            enqueue_failed = true;
-            break;
-        }
-
-        if (!set_dft_kernel_args(
-                selected_dft_kernel,
-                actual_mode,
-                res.windowed_frames_buffer,
-                res.output_subbuffer,
-                window_size,
-                num_bins,
-                result.num_frames)) {
-            enqueue_failed = true;
-            break;
-        }
-
-        const size_t window_global[2] = {
-            static_cast<size_t>(result.num_frames),
-            round_up(static_cast<size_t>(window_size), window_local[1])
-        };
-
-        const size_t dft_global[2] = {
-            static_cast<size_t>(result.num_frames),
-            round_up(static_cast<size_t>(num_bins), dft_local[1])
-        };
-
-        err = clEnqueueNDRangeKernel(
+        const cl_int err = clEnqueueReadBuffer(
             cl_ctx.queue,
-            window_kernel,
-            2,
-            nullptr,
-            window_global,
-            window_local,
+            res.output_subbuffer,
+            CL_FALSE,
             0,
-            nullptr,
-            &res.window_event
-        );
-        if (!check_opencl_error(err, "Failed to enqueue batch window kernel")) {
-            enqueue_failed = true;
-            break;
-        }
-
-        err = clEnqueueNDRangeKernel(
-            cl_ctx.queue,
-            selected_dft_kernel,
-            2,
-            nullptr,
-            dft_global,
-            dft_local,
+            info.byte_size,
+            result.values.data(),
             1,
-            &res.window_event,
-            &res.dft_event
+            &res.dft_event,
+            &res.read_event
         );
-        if (!check_opencl_error(err, "Failed to enqueue batch DFT kernel")) {
-            enqueue_failed = true;
-            break;
+
+        if (!check_opencl_error(err, "Failed to enqueue batch read buffer")) {
+            return false;
         }
     }
 
-    if (!enqueue_failed) {
-        for (size_t i = 0; i < batch_inputs.size(); ++i) {
-            const auto& info = infos[i];
-            auto& result = results[i].second;
-            auto& res = resources[i];
+    return true;
+}
 
-            if (result.values.empty() || res.output_subbuffer == nullptr) {
-                continue;
-            }
-
-            err = clEnqueueReadBuffer(
-                cl_ctx.queue,
-                res.output_subbuffer,
-                CL_FALSE,
-                0,
-                info.byte_size,
-                result.values.data(),
-                1,
-                &res.dft_event,
-                &res.read_event
-            );
-            if (!check_opencl_error(err, "Failed to enqueue batch read buffer")) {
-                enqueue_failed = true;
-                break;
-            }
-        }
-    }
-
-    if (!enqueue_failed) {
-        err = clFinish(cl_ctx.queue);
-        check_opencl_error(err, "Failed to finish batch queue");
-    }
-
+/*
+ * Collects and reports batch kernel timings. If requested, one timing value
+ * per batch item is stored in gpu_times_ms.
+ */
+void collect_batch_timings(
+    const std::vector<BatchRunResources>& resources,
+    OpenCLKernelMode actual_mode,
+    std::vector<double>* gpu_times_ms
+) {
     double total_window_kernel_ms = 0.0;
     double total_dft_kernel_ms = 0.0;
 
     if (gpu_times_ms != nullptr) {
-        gpu_times_ms->resize(batch_inputs.size(), 0.0);
+        gpu_times_ms->assign(resources.size(), 0.0);
     }
 
     for (size_t i = 0; i < resources.size(); ++i) {
-        auto& res = resources[i];
+        const auto& res = resources[i];
 
         const double window_ms = get_event_time_ms(res.window_event);
         const double dft_ms = get_event_time_ms(res.dft_event);
@@ -886,6 +905,276 @@ compute_spectrogram_opencl_batch(
               << (actual_mode == OpenCLKernelMode::Local ? "local" : "naive")
               << "): "
               << total_dft_kernel_ms << " ms\n";
+}
+
+}  // namespace
+
+/*
+ * Computes a spectrogram for one audio signal using the OpenCL pipeline.
+ *
+ * Execution flow:
+ *   1. Validate parameters and compute output dimensions.
+ *   2. Initialize OpenCL and choose the DFT kernel variant.
+ *   3. Create kernels and allocate device buffers.
+ *   4. Launch the windowing kernel.
+ *   5. Launch the DFT kernel after windowing completes.
+ *   6. Wait for completion, collect profiling times, and read results back.
+ *   7. Release all OpenCL resources before returning.
+ *
+ * The returned SpectrogramResult stores power values in row-major order:
+ * consecutive frames, each containing num_bins values.
+ */
+SpectrogramResult compute_spectrogram_opencl(
+    const std::vector<float>& samples,
+    int window_size,
+    int hop_size,
+    int num_bins,
+    double* gpu_time_ms,
+    OpenCLKernelMode kernel_mode
+) {
+    SpectrogramResult result{};
+    if (!initialize_single_result(
+            samples,
+            window_size,
+            hop_size,
+            num_bins,
+            result,
+            gpu_time_ms)) {
+        return result;
+    }
+
+    OpenCLContext cl_ctx{};
+    if (!initialize_opencl(cl_ctx, "kernels/spectrogram.cl")) {
+        std::cerr << "Failed to initialize OpenCL.\n";
+        return {};
+    }
+
+    const OpenCLKernelMode actual_mode = resolve_kernel_mode(
+        cl_ctx.device,
+        window_size,
+        kernel_mode
+    );
+
+    cl_kernel window_kernel = nullptr;
+    cl_kernel dft_kernel_naive = nullptr;
+    cl_kernel dft_kernel_local = nullptr;
+
+    if (!create_kernels(
+            cl_ctx,
+            window_kernel,
+            dft_kernel_naive,
+            dft_kernel_local)) {
+        cleanup_opencl(cl_ctx);
+        return {};
+    }
+
+    const cl_kernel selected_dft_kernel =
+        (actual_mode == OpenCLKernelMode::Local)
+            ? dft_kernel_local
+            : dft_kernel_naive;
+
+    SingleRunResources res{};
+    if (!create_single_buffers(
+            cl_ctx,
+            samples,
+            result,
+            window_size,
+            res)) {
+        release_single_resources(res);
+        release_kernel_set(window_kernel, dft_kernel_naive, dft_kernel_local);
+        cleanup_opencl(cl_ctx);
+        return {};
+    }
+
+    if (!set_single_kernel_args(
+            window_kernel,
+            selected_dft_kernel,
+            actual_mode,
+            res,
+            static_cast<int>(samples.size()),
+            window_size,
+            hop_size,
+            num_bins,
+            result.num_frames)) {
+        release_single_resources(res);
+        release_kernel_set(window_kernel, dft_kernel_naive, dft_kernel_local);
+        cleanup_opencl(cl_ctx);
+        return {};
+    }
+
+    const KernelLaunchConfig cfg = make_launch_config(
+        result.num_frames,
+        window_size,
+        num_bins
+    );
+
+    if (!enqueue_single_pipeline(
+            cl_ctx,
+            window_kernel,
+            selected_dft_kernel,
+            cfg,
+            res)) {
+        release_single_resources(res);
+        release_kernel_set(window_kernel, dft_kernel_naive, dft_kernel_local);
+        cleanup_opencl(cl_ctx);
+        return {};
+    }
+
+    if (!finalize_single_run(
+            cl_ctx,
+            res,
+            actual_mode,
+            result,
+            gpu_time_ms)) {
+        release_single_resources(res);
+        release_kernel_set(window_kernel, dft_kernel_naive, dft_kernel_local);
+        cleanup_opencl(cl_ctx);
+        return {};
+    }
+
+    release_single_resources(res);
+    release_kernel_set(window_kernel, dft_kernel_naive, dft_kernel_local);
+    cleanup_opencl(cl_ctx);
+    return result;
+}
+
+/*
+ * Computes spectrograms for multiple audio signals using a shared OpenCL
+ * context and one parent output buffer partitioned into sub-buffers.
+ *
+ * Each batch item still receives its own input and intermediate buffers,
+ * but all outputs are packed into one parent device buffer for simpler
+ * management. Profiling times are optionally returned per batch item.
+ */
+std::vector<std::pair<std::string, SpectrogramResult>>
+compute_spectrogram_opencl_batch(
+    const std::vector<std::pair<std::string, std::vector<float>>>& batch_inputs,
+    int window_size,
+    int hop_size,
+    int num_bins,
+    std::vector<double>* gpu_times_ms,
+    OpenCLKernelMode kernel_mode
+) {
+    std::vector<std::pair<std::string, SpectrogramResult>> results;
+    std::vector<BatchItemInfo> infos;
+    std::vector<BatchRunResources> resources;
+    size_t total_output_bytes = 0;
+
+    if (gpu_times_ms != nullptr) {
+        gpu_times_ms->clear();
+    }
+
+    if (window_size <= 0 || hop_size <= 0 || num_bins <= 0) {
+        std::cerr << "Invalid OpenCL batch spectrogram parameters.\n";
+        return results;
+    }
+
+    resources.resize(batch_inputs.size());
+    initialize_batch_layout(
+        batch_inputs,
+        window_size,
+        hop_size,
+        num_bins,
+        results,
+        infos,
+        total_output_bytes
+    );
+
+    OpenCLContext cl_ctx{};
+    if (!initialize_opencl(cl_ctx, "kernels/spectrogram.cl")) {
+        std::cerr << "Failed to initialize OpenCL for batch mode.\n";
+        return {};
+    }
+
+    const OpenCLKernelMode actual_mode = resolve_kernel_mode(
+        cl_ctx.device,
+        window_size,
+        kernel_mode
+    );
+
+    cl_kernel window_kernel = nullptr;
+    cl_kernel dft_kernel_naive = nullptr;
+    cl_kernel dft_kernel_local = nullptr;
+
+    if (!create_kernels(
+            cl_ctx,
+            window_kernel,
+            dft_kernel_naive,
+            dft_kernel_local)) {
+        cleanup_opencl(cl_ctx);
+        return {};
+    }
+
+    const cl_kernel selected_dft_kernel =
+        (actual_mode == OpenCLKernelMode::Local)
+            ? dft_kernel_local
+            : dft_kernel_naive;
+
+    cl_int err = CL_SUCCESS;
+    cl_mem parent_output_buffer = create_parent_output_buffer(
+        cl_ctx,
+        total_output_bytes
+    );
+    if (parent_output_buffer == nullptr) {
+        err = CL_OUT_OF_RESOURCES;
+    }
+
+    if (!check_opencl_error(err, "Failed to create parent output buffer")) {
+        release_kernel_set(window_kernel, dft_kernel_naive, dft_kernel_local);
+        cleanup_opencl(cl_ctx);
+        return {};
+    }
+
+    bool enqueue_failed = false;
+
+    /*
+     * Create per-item buffers, bind the correct kernel arguments, and enqueue
+     * windowing plus DFT work for each valid input in the batch.
+     */
+    for (size_t i = 0; i < batch_inputs.size(); ++i) {
+        const auto& samples = batch_inputs[i].second;
+        auto& result = results[i].second;
+        auto& res = resources[i];
+
+        if (result.values.empty()) {
+            continue;
+        }
+
+        if (!enqueue_batch_item(
+                cl_ctx,
+                window_kernel,
+                selected_dft_kernel,
+                actual_mode,
+                parent_output_buffer,
+                samples,
+                infos[i],
+                result,
+                window_size,
+                hop_size,
+                num_bins,
+                res)) {
+            enqueue_failed = true;
+            break;
+        }
+    }
+
+    if (!enqueue_failed) {
+        enqueue_failed = !enqueue_batch_reads(
+            cl_ctx,
+            infos,
+            results,
+            resources
+        );
+    }
+
+    if (!enqueue_failed) {
+        err = clFinish(cl_ctx.queue);
+        enqueue_failed = !check_opencl_error(err, "Failed to finish batch queue");
+    }
+
+    if (!enqueue_failed) {
+        collect_batch_timings(resources, actual_mode, gpu_times_ms);
+    }
 
     release_batch_resources(resources);
 
@@ -893,11 +1182,7 @@ compute_spectrogram_opencl_batch(
         clReleaseMemObject(parent_output_buffer);
     }
 
-    release_kernel_set(
-        window_kernel,
-        dft_kernel_naive,
-        dft_kernel_local
-    );
+    release_kernel_set(window_kernel, dft_kernel_naive, dft_kernel_local);
     cleanup_opencl(cl_ctx);
 
     if (enqueue_failed) {

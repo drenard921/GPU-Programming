@@ -6,6 +6,8 @@ April 22nd 2026
 # OpenCL Assignment  
 ## Spectrogram Generation with CPU Baseline and OpenCL Acceleration
 
+![RickRoll](./Rick_roll.png)
+
 ## Overview
 
 This project implements a spectrogram generator in C++ with both a CPU
@@ -245,7 +247,7 @@ nmake /f Makefile.vc batch_gpu_local
 nmake /f Makefile.vc batch_both
 ```
 
-I had issue getting my WSL environment to recongnize my Nvidia GPU so adding a windows specific Makefile was implemented to allow for practical speedup testing beyond CPU only benchmarks.
+I had issue getting my WSL environment to recognize my Nvidia GPU so adding a windows specific Makefile was implemented to allow for practical speedup testing beyond CPU only benchmarks.
 
 ## Output
 
@@ -483,7 +485,8 @@ justifies GPU acceleration for this workload.
 ## Conclusion
 
 This project demonstrates that OpenCL can provide substantial acceleration for
-spectrogram generation whether it be a 2-3x speedup on the same hardware or a 300x speedup if employing the GPU. Demonstrating the cross-platform benefit OpenCL has agnostic of hardware. 
+spectrogram generation whether it be a 2-3x speedup on the same hardware or a 300x speedup if employing the GPU. Demonstrating the cross-platform benefit OpenCL has across different hardware.
+
 The final Windows-native OpenCL implementation running on an NVIDIA GeForce
 RTX 4060 Laptop GPU achieved strong performance on both batch and single-file
 audio workloads, including a **331.7x compute speedup** over the CPU baseline
@@ -501,3 +504,16 @@ Overall, this project moved beyond a toy OpenCL example by combining CPU and
 GPU implementations, single-file and batch execution, multiple build paths,
 kernel profiling, environment-aware analysis, and direct naive-vs-local kernel
 comparison in one complete application.
+
+## Sources
+
+The following public sources were used during development, testing, and interpretation of results.
+
+1. Andrada Olteanu. *GTZAN Dataset - Music Genre Classification*. Kaggle. Used for batch benchmarking, especially the `genres_original/blues` subset containing 100 audio clips.  
+   https://www.kaggle.com/datasets/andradaolteanu/gtzan-dataset-music-genre-classification
+
+2. *Rick Astley - Never Gonna Give You Up* spectrogram-style YouTube source. Used as the basis for preparing the long-form `rickroll_16bit.wav` benchmark input used in single-file CPU vs GPU testing.  
+   https://www.youtube.com/watch?v=y24ZI-8Q9mk
+
+3. Introductory spectrogram explanation video. Used for general conceptual reference on how spectrograms represent frequency over time.  
+   https://www.youtube.com/watch?v=_FatxGN3vAM

@@ -1,10 +1,18 @@
 # Makefile.vc
 # Usage:
 #   nmake /f Makefile.vc
+#   nmake /f Makefile.vc run
+#   nmake /f Makefile.vc run_cpu
+#   nmake /f Makefile.vc run_gpu
 #   nmake /f Makefile.vc run_gpu_local
 #   nmake /f Makefile.vc run_gpu_naive
+#   nmake /f Makefile.vc run_both
+#   nmake /f Makefile.vc batch_run
+#   nmake /f Makefile.vc batch_cpu
+#   nmake /f Makefile.vc batch_gpu
 #   nmake /f Makefile.vc batch_gpu_local
 #   nmake /f Makefile.vc batch_gpu_naive
+#   nmake /f Makefile.vc batch_both
 #   nmake /f Makefile.vc clean
 
 CXX=cl
@@ -31,7 +39,7 @@ $(TARGET):
 
 run: $(TARGET)
 !if "$(MODE)" == "cpu"
-	.\$(TARGET) "$(INPUT)" "$(MODE)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+	.\$(TARGET) "$(INPUT)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
 !else
 	.\$(TARGET) "$(INPUT)" "$(MODE)" "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
 !endif
@@ -50,6 +58,13 @@ run_gpu_local: $(TARGET)
 
 run_both: $(TARGET)
 	.\$(TARGET) "$(INPUT)" both "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+
+batch_run: $(TARGET)
+!if "$(MODE)" == "cpu"
+	.\$(TARGET) "$(BATCH_DIR)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
+!else
+	.\$(TARGET) "$(BATCH_DIR)" "$(MODE)" "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+!endif
 
 batch_cpu: $(TARGET)
 	.\$(TARGET) "$(BATCH_DIR)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
@@ -80,6 +95,7 @@ help:
 	@echo   nmake /f Makefile.vc run_gpu_naive
 	@echo   nmake /f Makefile.vc run_gpu_local
 	@echo   nmake /f Makefile.vc run_both
+	@echo   nmake /f Makefile.vc batch_run
 	@echo   nmake /f Makefile.vc batch_cpu
 	@echo   nmake /f Makefile.vc batch_gpu
 	@echo   nmake /f Makefile.vc batch_gpu_naive

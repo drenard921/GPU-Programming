@@ -33,8 +33,8 @@ BINS       ?= 512
 
 # ===== Targets =====
 .PHONY: all build run run_cpu run_gpu run_gpu_naive run_gpu_local run_both \
-        batch_cpu batch_gpu batch_gpu_naive batch_gpu_local batch_both \
-        clean rebuild help dirs
+        batch_run batch_cpu batch_gpu batch_gpu_naive batch_gpu_local \
+        batch_both clean rebuild help dirs
 
 all: build
 
@@ -53,7 +53,11 @@ $(SRC_DIR)/%.o: $(SRC_DIR)/%.cpp
 # ===== Single-file modes =====
 
 run: build
+ifeq ($(MODE),cpu)
+	./$(TARGET) "$(INPUT)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
+else
 	./$(TARGET) "$(INPUT)" "$(MODE)" "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+endif
 
 run_cpu: build
 	./$(TARGET) "$(INPUT)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
@@ -72,6 +76,13 @@ run_both: build
 
 # ===== Directory batch modes =====
 # These assume main.cpp treats directory input as batch mode.
+
+batch_run: build
+ifeq ($(MODE),cpu)
+	./$(TARGET) "$(BATCH_DIR)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
+else
+	./$(TARGET) "$(BATCH_DIR)" "$(MODE)" "$(KERNEL)" "$(WINDOW)" "$(HOP)" "$(BINS)"
+endif
 
 batch_cpu: build
 	./$(TARGET) "$(BATCH_DIR)" cpu "$(WINDOW)" "$(HOP)" "$(BINS)"
@@ -102,6 +113,7 @@ help:
 	@echo "  make run_gpu_naive"
 	@echo "  make run_gpu_local"
 	@echo "  make run_both"
+	@echo "  make batch_run"
 	@echo "  make batch_cpu"
 	@echo "  make batch_gpu"
 	@echo "  make batch_gpu_naive"
@@ -122,11 +134,14 @@ help:
 	@echo "  make run"
 	@echo "  make run MODE=gpu KERNEL=local"
 	@echo "  make run MODE=gpu KERNEL=naive"
+	@echo "  make run_cpu"
 	@echo "  make run_gpu"
 	@echo "  make run_gpu_naive"
 	@echo "  make run_gpu_local"
 	@echo "  make run_both KERNEL=local"
 	@echo "  make run INPUT=Data/genres_original/jazz/jazz.00000.wav MODE=both KERNEL=naive"
+	@echo "  make batch_run MODE=cpu"
+	@echo "  make batch_run MODE=gpu KERNEL=local"
 	@echo "  make batch_gpu"
 	@echo "  make batch_gpu_naive"
 	@echo "  make batch_gpu_local"
