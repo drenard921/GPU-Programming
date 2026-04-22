@@ -431,7 +431,6 @@ clear overall end-to-end advantage.
 
 ![GPU naive vs CPU baseline on RickRoll](./GPU%20OpenCL%20Naive%20vs%20CPU%20baseline.png)
 
-![Speedup comparison GPU vs CPU](./Speedup%20comparison%20GPU%20vs%20CPU.png)
 
 ![GPU OpenCL RickRoll naive runtime](./GPU%20OpenCL%20RickRoll%20Runtime.png)
 
