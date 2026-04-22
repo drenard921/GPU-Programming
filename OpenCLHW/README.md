@@ -6,7 +6,7 @@ April 22nd 2026
 # OpenCL Assignment  
 ## Spectrogram Generation with CPU Baseline and OpenCL Acceleration
 
-![RickRoll](./Rick_roll_small.png){ width=60% }
+![RickRoll](./Rick_roll_small.png)
 
 ## Overview
 
