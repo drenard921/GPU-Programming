@@ -155,7 +155,10 @@ void drawParticles(const std::vector<Particle>& particles) {
     glPointSize(3.0f);
     glBegin(GL_POINTS);
     for (const auto& p : particles) {
-        if (p.type == 0) {
+        if (p.type == 0 &&
+            std::isfinite(p.x) &&
+            std::isfinite(p.y) &&
+            std::isfinite(p.z)) {
             // fluid/background tracers
             glColor4f(0.20f, 0.65f, 1.0f, 0.30f);
             glVertex3f(p.x, p.y, p.z);
@@ -166,7 +169,10 @@ void drawParticles(const std::vector<Particle>& particles) {
     glPointSize(4.8f);
     glBegin(GL_POINTS);
     for (const auto& p : particles) {
-        if (p.type == 1) {
+        if (p.type == 1 &&
+            std::isfinite(p.x) &&
+            std::isfinite(p.y) &&
+            std::isfinite(p.z)) {
             // retained/suspended cells
             glColor4f(0.95f, 0.82f, 0.20f, 1.0f);
             glVertex3f(p.x, p.y, p.z);
