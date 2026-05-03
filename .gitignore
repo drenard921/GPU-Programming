@@ -36,3 +36,8 @@
 libretro-super/
 mgba/
 OpenCLHW/Data/
+# Rotea generated build/replay files
+RoteaFinalProject/*.bin
+RoteaFinalProject/frames*.bin
+RoteaFinalProject/bin/
+RoteaFinalProject/build/
